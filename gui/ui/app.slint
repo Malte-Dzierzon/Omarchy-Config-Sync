@@ -1,0 +1,741 @@
+import { ScrollView } from "std-widgets.slint";
+
+struct FileEntry {
+    path: string,
+    checked: bool,
+    note: string,
+    state: int,
+}
+
+// app state: 0 idle, 1 ok, 2 warn
+struct AppEntry {
+    id: string,
+    name: string,
+    checked: bool,
+    active: bool,
+    sub: string,
+    state: int,
+}
+
+// Fixed-size icon box: the glyph (11px) always has room, never clips.
+component Icon inherits Rectangle {
+    in property <string> glyph;
+    in property <color> fg;
+    in property <length> px: 11px;
+    width: 20px;
+    height: 20px;
+    Text {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        text: glyph;
+        color: fg;
+        font-size: px;
+        font-family: "JetBrainsMono Nerd Font";
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// Accent checkbox — no default-blue widgets anywhere.
+component Check inherits Rectangle {
+    in property <bool> on;
+    in property <color> accent;
+    in property <color> on-accent;
+    in property <color> faint;
+    callback toggled(bool);
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: on ? transparent : faint;
+    background: on ? accent : transparent;
+    TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        mouse-cursor: pointer;
+        clicked => { root.toggled(!root.on); }
+    }
+    Text {
+        text: "\u{f00c}";
+        color: on-accent;
+        font-size: 10px;
+        font-family: "JetBrainsMono Nerd Font";
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        visible: on;
+    }
+}
+
+// Themed text field: radius + accent focus ring follow the Omarchy theme.
+component Field inherits Rectangle {
+    in-out property <string> value;
+    in property <string> hint;
+    in property <color> box-bg;
+    in property <color> ink;
+    in property <color> faint;
+    in property <color> accent;
+    in property <length> rad;
+    height: 34px;
+    border-radius: rad;
+    background: box-bg;
+    border-width: 1px;
+    border-color: fi.has-focus ? accent : transparent;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        Text {
+            text: hint;
+            color: faint;
+            font-size: 12px;
+            vertical-alignment: center;
+            visible: value == "";
+        }
+        fi := TextInput {
+            text <=> value;
+            color: ink;
+            font-size: 12px;
+            font-family: "JetBrainsMono Nerd Font";
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+// file state: 0 synced, 1 modified, 2 new local, 3 repo-only
+component FileRow inherits Rectangle {
+    in property <string> fpath;
+    in property <bool> fchecked;
+    in property <string> fnote;
+    in property <color> fdot;
+    in property <color> ink;
+    in property <color> faint;
+    in property <color> accent;
+    in property <color> on-accent;
+    callback toggled(bool);
+    height: 32px;
+    HorizontalLayout {
+        spacing: 9px;
+        padding-left: 2px;
+        padding-right: 2px;
+        VerticalLayout {
+            alignment: center;
+            Check {
+                on: fchecked;
+                accent: accent;
+                on-accent: on-accent;
+                faint: faint;
+                toggled(v) => { root.toggled(v); }
+            }
+        }
+        Text {
+            text: fpath;
+            color: ink;
+            font-size: 12px;
+            font-family: "JetBrainsMono Nerd Font";
+            horizontal-stretch: 1;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: fdot;
+            }
+        }
+        Text {
+            text: fnote;
+            color: faint;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component ActionButton inherits Rectangle {
+    in property <string> label;
+    in property <string> icon;
+    in property <color> btn-bg;
+    in property <color> btn-fg;
+    in property <length> rad;
+    in property <length> h: 34px;
+    callback clicked();
+    height: h;
+    min-width: 84px;
+    border-radius: rad;
+    background: btn-bg;
+    TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        alignment: center;
+        spacing: 7px;
+        padding-left: 12px;
+        padding-right: 12px;
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                glyph: icon;
+                fg: btn-fg;
+                visible: icon != "";
+            }
+        }
+        Text {
+            text: label;
+            color: btn-fg;
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component AppRow inherits Rectangle {
+    in property <string> app-name;
+    in property <string> app-sub;
+    in property <bool> is-active;
+    in property <bool> is-checked;
+    in property <color> dot;
+    in property <color> card-bg;
+    in property <color> ink;
+    in property <color> faint;
+    in property <color> accent;
+    in property <color> on-accent;
+    in property <length> rad;
+    callback toggled(bool);
+    callback select();
+    height: 58px;
+    border-radius: rad;
+    background: is-active ? card-bg : transparent;
+    TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        mouse-cursor: pointer;
+        clicked => { root.select(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            Check {
+                on: is-checked;
+                accent: accent;
+                on-accent: on-accent;
+                faint: faint;
+                toggled(v) => { root.toggled(v); }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 9px;
+                height: 9px;
+                border-radius: 4px;
+                background: dot;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: app-name;
+                color: ink;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            Text {
+                text: app-sub;
+                color: faint;
+                font-size: 11px;
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Config Sync";
+    preferred-width: 820px;
+    preferred-height: 780px;
+    background: bg;
+
+    // ---- live Omarchy theme, applied silently (no theme UI) ----
+    in-out property <color> bg: #070e15;
+    in-out property <color> surface: #20262c;
+    in-out property <color> sel-bg: #2b333a;
+    in-out property <color> console: #050b10;
+    in-out property <color> ink: #e9efeb;
+    in-out property <color> faint: #62676c;
+    in-out property <color> accent: #97a6bb;
+    in-out property <color> on-accent: #070e15;
+    in-out property <color> ok: #82967f;
+    in-out property <color> warn: #96937b;
+    in-out property <color> bad: #857960;
+
+    in-out property <length> radius: 10px;
+
+    // ---- state ----
+    in-out property <string> config-dir;
+    in-out property <string> repo-dir;
+    in-out property <string> remote-url;
+    in-out property <string> restore-path;
+    in-out property <string> sync-summary: "nothing scanned yet";
+    in-out property <string> repo-status: "no repository configured";
+    in-out property <string> log-text: "";
+    in-out property <string> active-app: "zed";
+    in-out property <string> app-title: "Zed";
+    in-out property <string> app-detail: "pick apps on the left, then Scan";
+    in-out property <string> push-label: "Push";
+    in-out property <string> apply-label: "Apply";
+    in-out property <bool> download-mode: false;
+    in-out property <[AppEntry]> fav-apps;
+    in-out property <[AppEntry]> other-apps;
+    in-out property <[FileEntry]> files;
+    in-out property <[FileEntry]> repo-files;
+
+    callback scan();
+    callback activate(string);
+    callback app-toggled(string, bool);
+    callback file-toggled(int, bool);
+    callback repo-file-toggled(int, bool);
+    callback select-all();
+    callback select-none();
+    callback push(string);
+    callback apply(string);
+    callback download();
+    callback mode-toggle();
+    callback restore(string);
+    callback repo-fetch();
+    callback repo-pull();
+    callback repo-push();
+    callback repo-clone();
+    callback repo-init();
+    callback theme-tick();
+
+    VerticalLayout {
+        padding: 14px;
+        spacing: 10px;
+
+        Timer {
+            interval: 2500ms;
+            running: true;
+            triggered => { root.theme-tick(); }
+        }
+
+        // header: name + aggregate sync state, nothing else
+        HorizontalLayout {
+            spacing: 10px;
+            VerticalLayout {
+                alignment: center;
+                Icon { glyph: "\u{f1de}"; fg: accent; px: 15px; }
+            }
+            Text {
+                text: "Config Sync";                color: ink;
+                font-size: 20px;
+                font-weight: 800;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Text {
+                text: sync-summary;
+                color: faint;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+        }
+
+        // repository first: left = new, right = sync
+        Rectangle {
+            background: surface;
+            border-radius: radius;
+            VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout {
+                        alignment: center;
+                        Icon { glyph: "\u{f09b}"; fg: ink; px: 14px; }
+                    }
+                    Text {
+                        text: repo-status;
+                        color: faint;
+                        font-size: 12px;
+                        font-family: "JetBrainsMono Nerd Font";
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    ActionButton {
+                        label: "Check updates";
+                        icon: "\u{f021}";
+                        btn-bg: bg;
+                        btn-fg: ink;
+                        rad: radius;
+                        h: 32px;
+                        clicked => { repo-fetch(); }
+                    }
+                    ActionButton {
+                        label: "Pull";
+                        icon: "\u{f019}";
+                        btn-bg: bg;
+                        btn-fg: ink;
+                        rad: radius;
+                        h: 32px;
+                        clicked => { repo-pull(); }
+                    }
+                    ActionButton {
+                        label: "Push";
+                        icon: "\u{f093}";
+                        btn-bg: bg;
+                        btn-fg: ink;
+                        rad: radius;
+                        h: 32px;
+                        clicked => { repo-push(); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout {
+                        spacing: 3px;
+                        horizontal-stretch: 2;
+                        Text { text: "CONFIG DIR (AUTO)"; color: faint; font-size: 10px; font-weight: 700; }
+                        Field {
+                            value <=> config-dir;
+                            hint: "~/.config";
+                            box-bg: bg;
+                            ink: ink;
+                            faint: faint;
+                            accent: accent;
+                            rad: radius;
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 3px;
+                        horizontal-stretch: 2;
+                        Text { text: "LOCAL REPO PATH"; color: faint; font-size: 10px; font-weight: 700; }
+                        Field {
+                            value <=> repo-dir;
+                            hint: "~/config-data";
+                            box-bg: bg;
+                            ink: ink;
+                            faint: faint;
+                            accent: accent;
+                            rad: radius;
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 3px;
+                        horizontal-stretch: 3;
+                        Text { text: "GITHUB URL (ONLY FOR CLONE / PUBLISH)"; color: faint; font-size: 10px; font-weight: 700; }
+                        Field {
+                            value <=> remote-url;
+                            hint: "git@github.com:me/config-data.git";
+                            box-bg: bg;
+                            ink: ink;
+                            faint: faint;
+                            accent: accent;
+                            rad: radius;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    ActionButton {
+                        label: "New repository";
+                        icon: "\u{f067}";
+                        btn-bg: accent;
+                        btn-fg: on-accent;
+                        rad: radius;
+                        h: 38px;
+                        horizontal-stretch: 1;
+                        clicked => { repo-init(); }
+                    }
+                    ActionButton {
+                        label: "Clone";
+                        icon: "\u{f126}";
+                        btn-bg: bg;
+                        btn-fg: ink;
+                        rad: radius;
+                        h: 38px;
+                        clicked => { repo-clone(); }
+                    }
+                    VerticalLayout {
+                        spacing: 3px;
+                        horizontal-stretch: 2;
+                        alignment: center;
+                        Text { text: "RESTORE FROM BACKUP"; color: faint; font-size: 10px; font-weight: 700; }
+                        Field {
+                            value <=> restore-path;
+                            hint: "backup path from apply log, e.g. .../zed.bak.123";
+                            box-bg: bg;
+                            ink: ink;
+                            faint: faint;
+                            accent: accent;
+                            rad: radius;
+                        }
+                    }
+                    ActionButton {
+                        label: "Restore";
+                        icon: "\u{f0e2}";
+                        btn-bg: bg;
+                        btn-fg: ink;
+                        rad: radius;
+                        h: 38px;
+                        clicked => { restore(restore-path); }
+                    }
+                }
+            }
+        }
+
+        // content: sidebar + main
+        HorizontalLayout {
+            spacing: 10px;
+            vertical-stretch: 1;
+
+            Rectangle {
+                background: surface;
+                border-radius: radius;
+                width: 262px;
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 6px;
+                    Text { text: "FAVORITEN"; color: faint; font-size: 11px; font-weight: 700; }
+                    for ae in fav-apps: AppRow {
+                        app-name: ae.name;
+                        app-sub: ae.sub;
+                        is-active: ae.active;
+                        is-checked: ae.checked;
+                        dot: ae.state == 1 ? ok : ae.state == 2 ? warn : faint;
+                        card-bg: sel-bg;
+                        ink: ink;
+                        faint: faint;
+                        accent: accent;
+                        on-accent: on-accent;
+                        rad: radius;
+                        toggled(v) => { root.app-toggled(ae.id, v); }
+                        select => { root.activate(ae.id); }
+                    }
+                    Text { text: "ALLE APPS"; color: faint; font-size: 11px; font-weight: 700; }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            spacing: 4px;
+                            for ae in other-apps: AppRow {
+                                app-name: ae.name;
+                                app-sub: ae.sub;
+                                is-active: ae.active;
+                                is-checked: ae.checked;
+                                dot: ae.state == 1 ? ok : ae.state == 2 ? warn : faint;
+                                card-bg: sel-bg;
+                                ink: ink;
+                                faint: faint;
+                                accent: accent;
+                                on-accent: on-accent;
+                                rad: radius;
+                                toggled(v) => { root.app-toggled(ae.id, v); }
+                                select => { root.activate(ae.id); }
+                            }
+                        }
+                    }
+                    ActionButton {
+                        label: "Scan";
+                        icon: "\u{f002}";
+                        btn-bg: accent;
+                        btn-fg: on-accent;
+                        rad: radius;
+                        horizontal-stretch: 1;
+                        clicked => { scan(); }
+                    }
+                }
+            }
+
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: download-mode ? "Aus Repository übernehmen" : app-title;
+                        color: ink;
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: download-mode ? "" : app-detail;
+                        color: faint;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                    ActionButton {
+                        label: download-mode ? "Upload" : "Download";
+                        icon: download-mode ? "\u{f093}" : "\u{f019}";
+                        btn-bg: surface;
+                        btn-fg: ink;
+                        rad: radius;
+                        h: 30px;
+                        clicked => { mode-toggle(); }
+                    }
+                }
+                if !download-mode: HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "FILES"; color: faint; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    ActionButton {
+                        label: "All";
+                        btn-bg: surface;
+                        btn-fg: ink;
+                        rad: radius;
+                        h: 30px;
+                        clicked => { select-all(); }
+                    }
+                    ActionButton {
+                        label: "None";
+                        btn-bg: surface;
+                        btn-fg: ink;
+                        rad: radius;
+                        h: 30px;
+                        clicked => { select-none(); }
+                    }
+                }
+                if !download-mode: Rectangle {
+                    background: surface;
+                    border-radius: radius;
+                    vertical-stretch: 1;
+                    min-height: 150px;
+                    clip: true;
+                    ScrollView {
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 2px;
+                            if files.length == 0: Text {
+                                text: "Nothing scanned yet — pick apps on the left, then Scan.";
+                                color: faint;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                            for fe[idx] in files: FileRow {
+                                fpath: fe.path;
+                                fchecked: fe.checked;
+                                fnote: fe.note;
+                                fdot: fe.state == 0 ? ok : fe.state == 1 ? warn : fe.state == 2 ? accent : faint;
+                                ink: ink;
+                                faint: faint;
+                                accent: accent;
+                                on-accent: on-accent;
+                                toggled(v) => { file-toggled(idx, v); }
+                            }
+                        }
+                    }
+                }
+                if !download-mode: HorizontalLayout {
+                    spacing: 8px;
+                    ActionButton {
+                        label: push-label;
+                        icon: "\u{f093}";
+                        btn-bg: surface;
+                        btn-fg: ink;
+                        rad: radius;
+                        clicked => { push(active-app); }
+                    }
+                    ActionButton {
+                        label: apply-label;
+                        icon: "\u{f00c}";
+                        btn-bg: accent;
+                        btn-fg: on-accent;
+                        rad: radius;
+                        clicked => { apply(active-app); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                if download-mode: Rectangle {
+                    background: surface;
+                    border-radius: radius;
+                    vertical-stretch: 1;
+                    min-height: 150px;
+                    clip: true;
+                    ScrollView {
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 2px;
+                            if repo-files.length == 0: Text {
+                                text: "Noch kein Repository — oben klonen oder anlegen, dann erscheinen hier die Apps daraus.";
+                                color: faint;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                            for re[ridx] in repo-files: FileRow {
+                                fpath: re.path;
+                                fchecked: re.checked;
+                                fnote: re.note;
+                                fdot: re.state == 0 ? ok : warn;
+                                ink: ink;
+                                faint: faint;
+                                accent: accent;
+                                on-accent: on-accent;
+                                toggled(v) => { repo-file-toggled(ridx, v); }
+                            }
+                        }
+                    }
+                }
+                if download-mode: HorizontalLayout {
+                    spacing: 8px;
+                    ActionButton {
+                        label: "Übernehmen";
+                        icon: "\u{f019}";
+                        btn-bg: accent;
+                        btn-fg: on-accent;
+                        rad: radius;
+                        clicked => { download(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+        }
+
+        // log
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                alignment: center;
+                Icon { glyph: "\u{f120}"; fg: faint; px: 12px; }
+            }
+            Text { text: "LOG"; color: faint; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+        }
+        Rectangle {
+            background: console;
+            border-radius: radius;
+            min-height: 90px;
+            max-height: 130px;
+            clip: true;
+            ScrollView {
+                VerticalLayout {
+                    padding: 10px;
+                    Text {
+                        text: log-text;
+                        color: ink;
+                        font-family: "JetBrainsMono Nerd Font";
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "ocs_gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "omarchy-config-sync: tiny Slint GUI over ocs_core"
+
+[[bin]]
+name = "ocs-gui"
+path = "src/main.rs"
+
+[dependencies]
+ocs_core = { path = "../core" }
+slint = "1.17"
+
+[build-dependencies]
+slint-build = "1.17"

@@ -1,0 +1,23 @@
+[workspace]
+members = ["core", "gui"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.dev]
+# Slim debug info: keeps panic locations + backtraces, but Slint's ~400
+# dependency crates shrink massively on disk and link faster.
+# Full `debug = true` only if you need breakpoints inside dependencies.
+debug = "line-tables-only"
+
+[profile.release]
+opt-level = "z"
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false
