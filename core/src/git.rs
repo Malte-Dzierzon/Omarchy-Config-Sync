@@ -202,6 +202,45 @@ pub fn push_upstream(repo: &Path) -> Result<String, GitError> {
     Ok("pushed".to_string())
 }
 
+/// Create a private GitHub repo via the `gh` CLI and attach it as `origin`.
+/// No-op change when `gh` is missing or not logged in (clear error instead).
+pub fn gh_create_repo(path: &Path, name: &str) -> Result<String, GitError> {
+    require_repo(path)?;
+    let clean: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if clean.is_empty() {
+        return Err(GitError("empty repository name".to_string()));
+    }
+    let out = std::process::Command::new("gh")
+        .arg("repo")
+        .arg("create")
+        .arg(&clean)
+        .arg("--private")
+        .arg("--source")
+        .arg(path)
+        .arg("--remote")
+        .arg("origin")
+        .output()
+        .map_err(|e| {
+            GitError(format!(
+                "cannot run gh (install it via `omarchy install gh`?): {e}"
+            ))
+        })?;
+    if out.status.success() {
+        Ok(format!("created {clean} on GitHub"))
+    } else {
+        Err(GitError(format!(
+            "gh repo create failed (logged in via `gh auth login`?): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+}
+
 /// Stage everything and commit once. No-op message when nothing changed.
 /// For the autonomous first snapshot (many apps, one commit).
 pub fn commit_all(repo: &Path, message: &str) -> Result<String, GitError> {
@@ -277,5 +316,41 @@ mod tests {
         let msg = commit_all(&repo, "initial sync").unwrap();
         assert!(msg.contains("committed"));
         assert!(repo_status(&repo).unwrap().clean);
+    }
+
+    #[test]
+    fn full_new_repository_flow_offline() {
+        // Mirrors the GUI "New repository" button, with a local bare repo
+        // standing in for GitHub (same git protocol, no network).
+        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+        std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(cfg.join("zed")).unwrap();
+        std::fs::write(cfg.join("zed/settings.json"), "{}").unwrap();
+        let origin = tmp.path().join("origin.git");
+        run_git(tmp.path(), &["init", "--bare", "-b", "main", "origin.git"]).unwrap();
+        let data = tmp.path().join("data");
+        init_repo(&data).unwrap();
+        let app = crate::apps::find_app("zed").unwrap();
+        let all: std::collections::HashSet<std::path::PathBuf> =
+            crate::store::list_local_rels(&cfg, &app)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.rel)
+                .collect();
+        let n = crate::store::snapshot_selected(&cfg, &data.join("zed"), &app, &all).unwrap();
+        assert_eq!(n, 1);
+        commit_all(&data, "initial sync").unwrap();
+        set_remote(&data, origin.to_str().unwrap()).unwrap();
+        push_upstream(&data).unwrap();
+        // the "GitHub" side now serves the files; a fresh clone gets them
+        let clone = tmp.path().join("clone");
+        clone_repo(origin.to_str().unwrap(), &clone).unwrap();
+        assert!(clone.join("zed/settings.json").is_file());
+        assert_eq!(
+            std::fs::read_to_string(clone.join("zed/settings.json")).unwrap(),
+            "{}"
+        );
     }
 }

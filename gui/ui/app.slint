@@ -71,6 +71,8 @@ component Check inherits Rectangle {
 }
 
 // Themed text field: radius + accent focus ring follow the Omarchy theme.
+// Hint floats BEHIND the input (both full width), so the input can never be
+// squeezed to zero width and every click lands in the TextInput.
 component Field inherits Rectangle {
     in-out property <string> value;
     in property <string> hint;
@@ -79,29 +81,34 @@ component Field inherits Rectangle {
     in property <color> faint;
     in property <color> accent;
     in property <length> rad;
-    height: 34px;
+    in property <length> h: 34px;
+    height: h;
     border-radius: rad;
     background: box-bg;
     border-width: 1px;
     border-color: fi.has-focus ? accent : transparent;
-    HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 10px;
-        Text {
-            text: hint;
-            color: faint;
-            font-size: 12px;
-            vertical-alignment: center;
-            visible: value == "";
-        }
-        fi := TextInput {
-            text <=> value;
-            color: ink;
-            font-size: 12px;
-            font-family: "JetBrainsMono Nerd Font";
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-        }
+    Text {
+        x: 10px;
+        y: 0;
+        width: parent.width - 20px;
+        height: parent.height;
+        text: hint;
+        color: faint;
+        font-size: 12px;
+        vertical-alignment: center;
+        overflow: elide;
+        visible: value == "";
+    }
+    fi := TextInput {
+        x: 10px;
+        y: 0;
+        width: parent.width - 20px;
+        height: parent.height;
+        text <=> value;
+        color: ink;
+        font-size: 12px;
+        font-family: "JetBrainsMono Nerd Font";
+        vertical-alignment: center;
     }
 }
 
@@ -413,20 +420,6 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         spacing: 3px;
                         horizontal-stretch: 2;
-                        Text { text: "CONFIG DIR (AUTO)"; color: faint; font-size: 10px; font-weight: 700; }
-                        Field {
-                            value <=> config-dir;
-                            hint: "~/.config";
-                            box-bg: bg;
-                            ink: ink;
-                            faint: faint;
-                            accent: accent;
-                            rad: radius;
-                        }
-                    }
-                    VerticalLayout {
-                        spacing: 3px;
-                        horizontal-stretch: 2;
                         Text { text: "LOCAL REPO PATH"; color: faint; font-size: 10px; font-weight: 700; }
                         Field {
                             value <=> repo-dir;
@@ -474,20 +467,16 @@ export component AppWindow inherits Window {
                         h: 38px;
                         clicked => { repo-clone(); }
                     }
-                    VerticalLayout {
-                        spacing: 3px;
+                    Field {
+                        value <=> restore-path;
+                        hint: ".../zed.bak.123";
+                        box-bg: bg;
+                        ink: ink;
+                        faint: faint;
+                        accent: accent;
+                        rad: radius;
+                        h: 38px;
                         horizontal-stretch: 2;
-                        alignment: center;
-                        Text { text: "RESTORE FROM BACKUP"; color: faint; font-size: 10px; font-weight: 700; }
-                        Field {
-                            value <=> restore-path;
-                            hint: "backup path from apply log, e.g. .../zed.bak.123";
-                            box-bg: bg;
-                            ink: ink;
-                            faint: faint;
-                            accent: accent;
-                            rad: radius;
-                        }
                     }
                     ActionButton {
                         label: "Restore";

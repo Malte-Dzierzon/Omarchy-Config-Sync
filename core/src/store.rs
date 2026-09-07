@@ -374,15 +374,21 @@ fn backup_targets(config_dir: &Path, app: &AppSpec) -> io::Result<Vec<(PathBuf, 
     for rel in &app.rel_paths {
         let target = config_dir.join(rel);
         if target.exists() {
-            let bak = PathBuf::from(format!("{}.bak.{}", target.display(), epoch));
-            if !bak.exists() {
-                std::fs::rename(&target, &bak).map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("backup failed for {}: {e}", target.display()),
-                    )
-                })?;
+            // Always a FRESH backup: bump the suffix until the name is free,
+            // so a second apply within the same second can never silently
+            // skip the backup (and merge back stale content afterwards).
+            let mut n = 0u32;
+            let mut bak = PathBuf::from(format!("{}.bak.{epoch}", target.display()));
+            while bak.exists() {
+                n += 1;
+                bak = PathBuf::from(format!("{}.bak.{epoch}-{n}", target.display()));
             }
+            std::fs::rename(&target, &bak).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("backup failed for {}: {e}", target.display()),
+                )
+            })?;
             pairs.push((bak, target));
         }
     }

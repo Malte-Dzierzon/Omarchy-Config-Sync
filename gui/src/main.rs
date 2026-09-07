@@ -887,7 +887,20 @@ fn main() -> Result<(), slint::PlatformError> {
                 Err(e) => log.push_str(&format!("commit failed: {e}\n")),
             }
             if url.is_empty() {
-                log.push_str("no URL — paste one above, Init again to attach it");
+                // Fully autonomous: create the GitHub repo via gh, then publish.
+                let name = repo
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("config-data")
+                    .to_string();
+                match git::gh_create_repo(&repo, &name)
+                    .and_then(|_| git::push_upstream(&repo))
+                {
+                    Ok(_) => log.push_str("GitHub repo created + published"),
+                    Err(e) => log.push_str(&format!(
+                        "local repo ready, GitHub create failed:\n{e}\nTip: paste a URL above (or create the empty repo on github.com), then Init again"
+                    )),
+                }
             } else {
                 match git::set_remote(&repo, &url).and_then(|_| git::push_upstream(&repo)) {
                     Ok(_) => log.push_str("remote attached + published to GitHub"),
