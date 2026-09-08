@@ -16,10 +16,17 @@ impl std::fmt::Display for GitError {
 impl std::error::Error for GitError {}
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String, GitError> {
+    // Hardening: hooks from the data repo never execute
+    // (`pull --ff-only` would otherwise trigger them), no auto-gc in the GUI.
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("gc.auto=0")
         .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .map_err(|e| GitError(format!("cannot run git: {e}")))?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -158,9 +165,14 @@ pub fn clone_repo(url: &str, dest: &Path) -> Result<String, GitError> {
         .parent()
         .ok_or_else(|| GitError("bad path".to_string()))?;
     let out = std::process::Command::new("git")
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("gc.auto=0")
         .arg("clone")
         .arg(url.trim())
         .arg(dest)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .current_dir(parent)
         .output()
         .map_err(|e| GitError(format!("cannot run git: {e}")))?;
@@ -255,6 +267,195 @@ pub fn commit_all(repo: &Path, message: &str) -> Result<String, GitError> {
     Ok(format!("committed{id_note}"))
 }
 
+/// One-button background sync: fetch, then fast-forward pull, then push.
+/// Pull/push failures are reported but never abort the whole summary —
+/// the GUI shows one line instead of three buttons.
+pub fn sync_repo(repo: &Path) -> Result<String, GitError> {
+    require_repo(repo)?;
+    run_git(repo, &["fetch", "--prune"])?;
+    let pull_note = match run_git(repo, &["pull", "--ff-only"]) {
+        Ok(_) => "pull ok".to_string(),
+        Err(e) => format!("pull skipped ({e})"),
+    };
+    let push_note = match run_git(repo, &["push"]) {
+        Ok(_) => "push ok".to_string(),
+        Err(e) => format!("push skipped ({e})"),
+    };
+    Ok(format!("fetched · {pull_note} · {push_note}"))
+}
+
+// --- GitHub browser login (minimal UX: one button, rest automatic) ---
+
+/// `gh` CLI present on PATH?
+pub fn gh_available() -> bool {
+    std::process::Command::new("gh")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhAuth {
+    pub logged_in: bool,
+    pub user: String,
+    pub hosts: Vec<String>,
+}
+
+impl GhAuth {
+    pub fn logged_out() -> Self {
+        GhAuth {
+            logged_in: false,
+            user: String::new(),
+            hosts: Vec::new(),
+        }
+    }
+}
+
+/// Parse `gh auth status` output (stdout+stderr combined). Pure + testable.
+/// Success samples:
+/// "✓ Logged in to github.com account malte (keyring)"
+/// "✓ Logged in to github.com as malte (oauth_token)"
+pub fn parse_gh_auth_status(combined: &str, success: bool) -> GhAuth {
+    if !success {
+        return GhAuth::logged_out();
+    }
+    let mut user = String::new();
+    let mut hosts = Vec::new();
+    for line in combined.lines() {
+        let line = line.trim();
+        if !line.contains("Logged in to") {
+            continue;
+        }
+        // host = token after "to"
+        if let Some(pos) = line.find("Logged in to ") {
+            let rest = &line[pos + "Logged in to ".len()..];
+            let host = rest.split_whitespace().next().unwrap_or("").to_string();
+            if !host.is_empty() && !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+        // user = token after "account " or "as "
+        if user.is_empty() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            for (i, w) in words.iter().enumerate() {
+                if (*w == "account" || *w == "as") && i + 1 < words.len() {
+                    let cand = words[i + 1]
+                        .trim_matches(|c| c == '(' || c == ')' || c == ',')
+                        .to_string();
+                    if !cand.is_empty() {
+                        user = cand;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if hosts.is_empty() {
+        return GhAuth::logged_out();
+    }
+    GhAuth {
+        logged_in: true,
+        user,
+        hosts,
+    }
+}
+
+/// Live `gh auth status` probe. Never errors — logged-out on any failure
+/// (missing binary, no login, broken config).
+pub fn gh_auth_status() -> GhAuth {
+    let out = std::process::Command::new("gh")
+        .arg("auth")
+        .arg("status")
+        .output();
+    match out {
+        Ok(o) => {
+            let mut combined = String::from_utf8_lossy(&o.stdout).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&o.stderr));
+            parse_gh_auth_status(&combined, o.status.success())
+        }
+        Err(_) => GhAuth::logged_out(),
+    }
+}
+
+/// Open a terminal running `gh auth login --web` (which itself opens the
+/// browser). Detached spawn — returns immediately, login completes in the
+/// terminal. Falls back to opening the device page when no terminal is found.
+pub fn launch_gh_login() -> Result<String, GitError> {
+    if !gh_available() {
+        return Err(GitError(
+            "gh CLI missing (omarchy install gh), then try again".to_string(),
+        ));
+    }
+    let attempts: &[&[&str]] = &[
+        &[
+            "xdg-terminal-exec",
+            "--hold",
+            "gh",
+            "auth",
+            "login",
+            "--web",
+        ],
+        &["foot", "--hold", "gh", "auth", "login", "--web"],
+        &["alacritty", "--hold", "-e", "gh", "auth", "login", "--web"],
+        &["kitty", "--hold", "gh", "auth", "login", "--web"],
+        &["ghostty", "-e", "gh", "auth", "login", "--web"],
+        &["x-terminal-emulator", "-e", "gh", "auth", "login", "--web"],
+    ];
+    for cmd in attempts {
+        let mut it = cmd.iter();
+        let Some(bin) = it.next() else { continue };
+        let args: Vec<&str> = it.copied().collect();
+        // Detached spawn: login runs in the terminal, the GUI stays open.
+        // (Spawn success != login success — the auto-tick notices completion.)
+        match std::process::Command::new(bin).args(&args).spawn() {
+            Ok(_) => {
+                return Ok(
+                    "Login terminal opened — confirm in the browser, then “I'm signed in”"
+                        .to_string(),
+                )
+            }
+            Err(_) => continue,
+        }
+    }
+    // Last resort: at least open the browser device page.
+    let _ = std::process::Command::new("xdg-open")
+        .arg("https://github.com/login/device")
+        .spawn();
+    Err(GitError(
+        "no terminal found for login — run `gh auth login --web` in a terminal".to_string(),
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupState {
+    NeedLogin,
+    NeedRepo,
+    Ready,
+}
+
+/// Testable setup classifier: login first, then repo presence.
+/// An empty path is never "Ready" (`Path::new("").join(".git")` would
+/// otherwise match `./.git` of whatever the CWD happens to be).
+pub fn setup_state_for(logged_in: bool, repo: &Path) -> SetupState {
+    if !logged_in {
+        return SetupState::NeedLogin;
+    }
+    if repo.as_os_str().is_empty() {
+        return SetupState::NeedRepo;
+    }
+    if repo.join(".git").exists() {
+        SetupState::Ready
+    } else {
+        SetupState::NeedRepo
+    }
+}
+
+/// Live setup state (probes `gh auth status` + `.git` presence).
+pub fn setup_state(repo: &Path) -> SetupState {
+    setup_state_for(gh_auth_status().logged_in, repo)
+}
+
 fn require_repo(repo: &Path) -> Result<(), GitError> {
     if repo.join(".git").exists() {
         Ok(())
@@ -268,6 +469,40 @@ fn require_repo(repo: &Path) -> Result<(), GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+
+    /// Env vars are process-global and tests run in parallel: every test
+    /// that hides the git identity restores the previous values on exit,
+    /// so no test can leak `/dev/null` config into another one.
+    struct HiddenIdentity {
+        prev_global: Option<OsString>,
+        prev_system: Option<OsString>,
+    }
+
+    impl HiddenIdentity {
+        fn hide() -> Self {
+            let prev = Self {
+                prev_global: std::env::var_os("GIT_CONFIG_GLOBAL"),
+                prev_system: std::env::var_os("GIT_CONFIG_SYSTEM"),
+            };
+            std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+            std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
+            prev
+        }
+    }
+
+    impl Drop for HiddenIdentity {
+        fn drop(&mut self) {
+            match self.prev_global.take() {
+                Some(v) => std::env::set_var("GIT_CONFIG_GLOBAL", v),
+                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+            }
+            match self.prev_system.take() {
+                Some(v) => std::env::set_var("GIT_CONFIG_SYSTEM", v),
+                None => std::env::remove_var("GIT_CONFIG_SYSTEM"),
+            }
+        }
+    }
 
     #[test]
     fn init_status_and_local_clone_roundtrip() {
@@ -305,8 +540,7 @@ mod tests {
     #[test]
     fn commit_works_without_any_git_identity() {
         // Hide every identity source from git child processes only.
-        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
-        std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
+        let _hidden = HiddenIdentity::hide();
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("fresh");
         init_repo(&repo).unwrap();
@@ -322,8 +556,7 @@ mod tests {
     fn full_new_repository_flow_offline() {
         // Mirrors the GUI "New repository" button, with a local bare repo
         // standing in for GitHub (same git protocol, no network).
-        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
-        std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
+        let _hidden = HiddenIdentity::hide();
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("config");
         std::fs::create_dir_all(cfg.join("zed")).unwrap();
@@ -352,5 +585,61 @@ mod tests {
             std::fs::read_to_string(clone.join("zed/settings.json")).unwrap(),
             "{}"
         );
+    }
+
+    #[test]
+    fn gh_auth_parses_logged_in_variants() {
+        let a = parse_gh_auth_status("✓ Logged in to github.com account malte (keyring)\n", true);
+        assert!(a.logged_in);
+        assert_eq!(a.user, "malte");
+        assert_eq!(a.hosts, vec!["github.com".to_string()]);
+        let b = parse_gh_auth_status(
+            "✓ Logged in to ghe.example.com as ci-bot (oauth_token)\n",
+            true,
+        );
+        assert!(b.logged_in);
+        assert_eq!(b.user, "ci-bot");
+        // failure output never counts as logged in
+        let c = parse_gh_auth_status(
+            "You are not logged into any GitHub hosts. To log in, run: gh auth login",
+            false,
+        );
+        assert!(!c.logged_in);
+        let d = parse_gh_auth_status("", true);
+        assert!(!d.logged_in);
+    }
+
+    #[test]
+    fn setup_classifier_prefers_login_over_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope");
+        assert_eq!(setup_state_for(false, &missing), SetupState::NeedLogin);
+        assert_eq!(setup_state_for(true, &missing), SetupState::NeedRepo);
+        // an empty path is never Ready (no CWD-relative `./.git` match)
+        assert_eq!(
+            setup_state_for(true, std::path::Path::new("")),
+            SetupState::NeedRepo
+        );
+        let repo = tmp.path().join("data");
+        init_repo(&repo).unwrap();
+        assert_eq!(setup_state_for(true, &repo), SetupState::Ready);
+        // login still wins even when a repo exists
+        assert_eq!(setup_state_for(false, &repo), SetupState::NeedLogin);
+    }
+
+    #[test]
+    fn sync_repo_reports_combined_summary_offline() {
+        let _hidden = HiddenIdentity::hide();
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        run_git(tmp.path(), &["init", "--bare", "-b", "main", "origin.git"]).unwrap();
+        let data = tmp.path().join("data");
+        init_repo(&data).unwrap();
+        std::fs::write(data.join("a.txt"), "a").unwrap();
+        commit_all(&data, "init").unwrap();
+        set_remote(&data, origin.to_str().unwrap()).unwrap();
+        push_upstream(&data).unwrap();
+        let summary = sync_repo(&data).unwrap();
+        assert!(summary.contains("fetched"));
     }
 }

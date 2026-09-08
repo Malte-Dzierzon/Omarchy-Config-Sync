@@ -51,6 +51,7 @@ component Check inherits Rectangle {
     border-width: 1px;
     border-color: on ? transparent : faint;
     background: on ? accent : transparent;
+    animate background { duration: 120ms; easing: ease-out; }
     TouchArea {
         x: 0;
         y: 0;
@@ -82,11 +83,14 @@ component Field inherits Rectangle {
     in property <color> accent;
     in property <length> rad;
     in property <length> h: 34px;
+    callback edited(string);
     height: h;
     border-radius: rad;
     background: box-bg;
     border-width: 1px;
     border-color: fi.has-focus ? accent : transparent;
+    animate border-color { duration: 150ms; easing: ease-out; }
+    clip: true;
     Text {
         x: 10px;
         y: 0;
@@ -109,6 +113,7 @@ component Field inherits Rectangle {
         font-size: 12px;
         font-family: "JetBrainsMono Nerd Font";
         vertical-alignment: center;
+        edited => { root.edited(self.text); }
     }
 }
 
@@ -174,10 +179,11 @@ component ActionButton inherits Rectangle {
     in property <length> h: 34px;
     callback clicked();
     height: h;
-    min-width: 84px;
+    min-width: 72px;
     border-radius: rad;
-    background: btn-bg;
-    TouchArea {
+    background: ta.pressed ? btn-bg.darker(0.15) : ta.has-hover ? btn-bg.brighter(0.08) : btn-bg;
+    animate background { duration: 150ms; easing: ease-out; }
+    ta := TouchArea {
         x: 0;
         y: 0;
         width: parent.width;
@@ -204,6 +210,7 @@ component ActionButton inherits Rectangle {
             font-size: 13px;
             font-weight: 600;
             vertical-alignment: center;
+            overflow: elide;
         }
     }
 }
@@ -215,6 +222,7 @@ component AppRow inherits Rectangle {
     in property <bool> is-checked;
     in property <color> dot;
     in property <color> card-bg;
+    in property <color> hover-bg;
     in property <color> ink;
     in property <color> faint;
     in property <color> accent;
@@ -224,8 +232,9 @@ component AppRow inherits Rectangle {
     callback select();
     height: 58px;
     border-radius: rad;
-    background: is-active ? card-bg : transparent;
-    TouchArea {
+    background: is-active ? card-bg : row-ta.has-hover ? hover-bg.with-alpha(0.35) : transparent;
+    animate background { duration: 150ms; easing: ease-out; }
+    row-ta := TouchArea {
         x: 0;
         y: 0;
         width: parent.width;
@@ -259,16 +268,19 @@ component AppRow inherits Rectangle {
         VerticalLayout {
             alignment: center;
             spacing: 2px;
+            horizontal-stretch: 1;
             Text {
                 text: app-name;
                 color: ink;
                 font-size: 13px;
                 font-weight: 600;
+                overflow: elide;
             }
             Text {
                 text: app-sub;
                 color: faint;
                 font-size: 11px;
+                overflow: elide;
             }
         }
     }
@@ -276,8 +288,13 @@ component AppRow inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "Config Sync";
-    preferred-width: 820px;
-    preferred-height: 780px;
+    // Flexible instead of fixed: adapts to small displays / scaling.
+    // Slint scales automatically with the display scale; min sizes keep
+    // everything usable, stretches fill large screens.
+    min-width: 660px;
+    min-height: 540px;
+    preferred-width: 980px;
+    preferred-height: 720px;
     background: bg;
 
     // ---- live Omarchy theme, applied silently (no theme UI) ----
@@ -302,6 +319,25 @@ export component AppWindow inherits Window {
     in-out property <string> restore-path;
     in-out property <string> sync-summary: "nothing scanned yet";
     in-out property <string> repo-status: "no repository configured";
+    in-out property <string> github-line: "GitHub";
+    in-out property <string> github-user: "";
+    in-out property <bool> github-connected: false;
+    in-out property <bool> show-repo-details: false;
+    in-out property <string> sync-label: "Sync";
+    in-out property <bool> show-welcome: true;
+    in-out property <bool> welcome-dismissed: false;
+    in-out property <string> welcome-detail: "";
+    // Subtle loading state: Braille spinner frames driven by a timer below.
+    // Only visible during network sync (local ops stay instant).
+    in-out property <bool> busy: false;
+    in-out property <int> spin-frame: 0;
+    property <[string]> spin-frames: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    // Sidebar filter + section headers with counts.
+    in-out property <string> app-filter: "";
+    in-out property <string> fav-header: "FAVORITES";
+    in-out property <string> other-header: "ALL APPS";
+    // One-time fade-in, set from Rust after startup.
+    in-out property <bool> ready: false;
     in-out property <string> log-text: "";
     in-out property <string> active-app: "zed";
     in-out property <string> app-title: "Zed";
@@ -317,6 +353,7 @@ export component AppWindow inherits Window {
     callback scan();
     callback activate(string);
     callback app-toggled(string, bool);
+    callback app-filter-changed(string);
     callback file-toggled(int, bool);
     callback repo-file-toggled(int, bool);
     callback select-all();
@@ -326,402 +363,600 @@ export component AppWindow inherits Window {
     callback download();
     callback mode-toggle();
     callback restore(string);
+    // Minimal GitHub UX: ein Sync + ein Setup statt 5 Buttons.
+    callback github-sync();
+    callback repo-setup();
+    callback github-login();
+    callback github-recheck();
+    callback welcome-dismiss();
+    // Old single-action callbacks stay wired for compatibility,
+    // the UI no longer calls them directly.
     callback repo-fetch();
     callback repo-pull();
     callback repo-push();
     callback repo-clone();
     callback repo-init();
     callback theme-tick();
+    callback auto-tick();
 
     VerticalLayout {
-        padding: 14px;
-        spacing: 10px;
+        padding: 12px;
+        spacing: 8px;
+        opacity: ready ? 1 : 0;
+        animate opacity { duration: 350ms; easing: ease-out; }
 
         Timer {
             interval: 2500ms;
             running: true;
             triggered => { root.theme-tick(); }
         }
-
-        // header: name + aggregate sync state, nothing else
-        HorizontalLayout {
-            spacing: 10px;
-            VerticalLayout {
-                alignment: center;
-                Icon { glyph: "\u{f1de}"; fg: accent; px: 15px; }
-            }
-            Text {
-                text: "Config Sync";                color: ink;
-                font-size: 20px;
-                font-weight: 800;
-                vertical-alignment: center;
-            }
-            Rectangle { horizontal-stretch: 1; }
-            Text {
-                text: sync-summary;
-                color: faint;
-                font-size: 12px;
-                vertical-alignment: center;
-            }
+        Timer {
+            interval: 30000ms;
+            running: true;
+            triggered => { root.auto-tick(); }
         }
-
-        // repository first: left = new, right = sync
-        Rectangle {
-            background: surface;
-            border-radius: radius;
-            VerticalLayout {
-                padding: 10px;
-                spacing: 8px;
-                HorizontalLayout {
-                    spacing: 8px;
-                    VerticalLayout {
-                        alignment: center;
-                        Icon { glyph: "\u{f09b}"; fg: ink; px: 14px; }
-                    }
-                    Text {
-                        text: repo-status;
-                        color: faint;
-                        font-size: 12px;
-                        font-family: "JetBrainsMono Nerd Font";
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
-                        overflow: elide;
-                    }
-                    ActionButton {
-                        label: "Check updates";
-                        icon: "\u{f021}";
-                        btn-bg: bg;
-                        btn-fg: ink;
-                        rad: radius;
-                        h: 32px;
-                        clicked => { repo-fetch(); }
-                    }
-                    ActionButton {
-                        label: "Pull";
-                        icon: "\u{f019}";
-                        btn-bg: bg;
-                        btn-fg: ink;
-                        rad: radius;
-                        h: 32px;
-                        clicked => { repo-pull(); }
-                    }
-                    ActionButton {
-                        label: "Push";
-                        icon: "\u{f093}";
-                        btn-bg: bg;
-                        btn-fg: ink;
-                        rad: radius;
-                        h: 32px;
-                        clicked => { repo-push(); }
-                    }
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    VerticalLayout {
-                        spacing: 3px;
-                        horizontal-stretch: 2;
-                        Text { text: "LOCAL REPO PATH"; color: faint; font-size: 10px; font-weight: 700; }
-                        Field {
-                            value <=> repo-dir;
-                            hint: "~/config-data";
-                            box-bg: bg;
-                            ink: ink;
-                            faint: faint;
-                            accent: accent;
-                            rad: radius;
-                        }
-                    }
-                    VerticalLayout {
-                        spacing: 3px;
-                        horizontal-stretch: 3;
-                        Text { text: "GITHUB URL (ONLY FOR CLONE / PUBLISH)"; color: faint; font-size: 10px; font-weight: 700; }
-                        Field {
-                            value <=> remote-url;
-                            hint: "git@github.com:me/config-data.git";
-                            box-bg: bg;
-                            ink: ink;
-                            faint: faint;
-                            accent: accent;
-                            rad: radius;
-                        }
-                    }
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    ActionButton {
-                        label: "New repository";
-                        icon: "\u{f067}";
-                        btn-bg: accent;
-                        btn-fg: on-accent;
-                        rad: radius;
-                        h: 38px;
-                        horizontal-stretch: 1;
-                        clicked => { repo-init(); }
-                    }
-                    ActionButton {
-                        label: "Clone";
-                        icon: "\u{f126}";
-                        btn-bg: bg;
-                        btn-fg: ink;
-                        rad: radius;
-                        h: 38px;
-                        clicked => { repo-clone(); }
-                    }
-                    Field {
-                        value <=> restore-path;
-                        hint: ".../zed.bak.123";
-                        box-bg: bg;
-                        ink: ink;
-                        faint: faint;
-                        accent: accent;
-                        rad: radius;
-                        h: 38px;
-                        horizontal-stretch: 2;
-                    }
-                    ActionButton {
-                        label: "Restore";
-                        icon: "\u{f0e2}";
-                        btn-bg: bg;
-                        btn-fg: ink;
-                        rad: radius;
-                        h: 38px;
-                        clicked => { restore(restore-path); }
-                    }
+        Timer {
+            interval: 100ms;
+            running: root.busy;
+            triggered => {
+                root.spin-frame = root.spin-frame + 1;
+                if (root.spin-frame >= 10) {
+                    root.spin-frame = 0;
                 }
             }
         }
 
-        // content: sidebar + main
-        HorizontalLayout {
-            spacing: 10px;
+        // ---------- Welcome (first run): 1 action, the rest is automatic ----------
+        if show-welcome: VerticalLayout {
             vertical-stretch: 1;
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                Rectangle {
+                    background: surface;
+                    border-radius: radius;
+                    min-width: 320px;
+                    max-width: 480px;
+                    horizontal-stretch: 0;
+                    VerticalLayout {
+                        padding: 24px;
+                        spacing: 10px;
+                        HorizontalLayout {
+                            alignment: center;
+                            Icon { glyph: "\u{f1de}"; fg: accent; px: 26px; }
+                        }
+                        Text {
+                            text: "Welcome to Config Sync";
+                            color: ink;
+                            font-size: 21px;
+                            font-weight: 800;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "Sign in once in the browser — repository, sync and backups then run quietly in the background.";
+                            color: faint;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { height: 4px; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                Icon { glyph: "\u{f00c}"; fg: ok; }
+                            }
+                            Text {
+                                text: "1. Sign in with GitHub in the browser";
+                                color: ink;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                wrap: word-wrap;
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                Icon { glyph: "\u{f00c}"; fg: ok; }
+                            }
+                            Text {
+                                text: "2. Repository is created or cloned automatically";
+                                color: ink;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                wrap: word-wrap;
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                Icon { glyph: "\u{f00c}"; fg: ok; }
+                            }
+                            Text {
+                                text: "3. Done — sync keeps running in the background";
+                                color: ink;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                wrap: word-wrap;
+                            }
+                        }
+                        Text {
+                            text: welcome-detail;
+                            color: faint;
+                            font-size: 11px;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                            visible: welcome-detail != "";
+                        }
+                        Rectangle { height: 4px; }
+                        ActionButton {
+                            label: "Sign in in the browser";
+                            icon: "\u{f09b}";
+                            btn-bg: accent;
+                            btn-fg: on-accent;
+                            rad: radius;
+                            h: 40px;
+                            horizontal-stretch: 1;
+                            clicked => { github-login(); }
+                        }
+                        ActionButton {
+                            label: "I'm signed in — continue";
+                            icon: "\u{f021}";
+                            btn-bg: bg;
+                            btn-fg: ink;
+                            rad: radius;
+                            h: 36px;
+                            horizontal-stretch: 1;
+                            clicked => { github-recheck(); }
+                        }
+                        ActionButton {
+                            label: "Start offline";
+                            icon: "";
+                            btn-bg: transparent;
+                            btn-fg: faint;
+                            rad: radius;
+                            h: 32px;
+                            horizontal-stretch: 1;
+                            clicked => { welcome-dismiss(); }
+                        }
+                    }
+                }
+            }
+        }
 
+        // ---------- Haupt-UI ----------
+        if !show-welcome: VerticalLayout {
+            vertical-stretch: 1;
+            spacing: 8px;
+
+            // header: name + aggregate sync state, nothing else
+            HorizontalLayout {
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    Icon { glyph: "\u{f1de}"; fg: accent; px: 15px; }
+                }
+                Text {
+                    text: "Config Sync";
+                    color: ink;
+                    font-size: 20px;
+                    font-weight: 800;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Text {
+                    text: sync-summary;
+                    color: faint;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+
+            // GitHub: one status line + Sync, details only on demand
             Rectangle {
                 background: surface;
                 border-radius: radius;
-                width: 262px;
                 VerticalLayout {
                     padding: 10px;
-                    spacing: 6px;
-                    Text { text: "FAVORITEN"; color: faint; font-size: 11px; font-weight: 700; }
-                    for ae in fav-apps: AppRow {
-                        app-name: ae.name;
-                        app-sub: ae.sub;
-                        is-active: ae.active;
-                        is-checked: ae.checked;
-                        dot: ae.state == 1 ? ok : ae.state == 2 ? warn : faint;
-                        card-bg: sel-bg;
-                        ink: ink;
-                        faint: faint;
-                        accent: accent;
-                        on-accent: on-accent;
-                        rad: radius;
-                        toggled(v) => { root.app-toggled(ae.id, v); }
-                        select => { root.activate(ae.id); }
-                    }
-                    Text { text: "ALLE APPS"; color: faint; font-size: 11px; font-weight: 700; }
-                    ScrollView {
-                        vertical-stretch: 1;
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 8px;
                         VerticalLayout {
-                            spacing: 4px;
-                            for ae in other-apps: AppRow {
-                                app-name: ae.name;
-                                app-sub: ae.sub;
-                                is-active: ae.active;
-                                is-checked: ae.checked;
-                                dot: ae.state == 1 ? ok : ae.state == 2 ? warn : faint;
-                                card-bg: sel-bg;
-                                ink: ink;
-                                faint: faint;
-                                accent: accent;
-                                on-accent: on-accent;
+                            alignment: center;
+                            Rectangle {
+                                width: 9px;
+                                height: 9px;
+                                border-radius: 4px;
+                                background: github-connected ? ok : warn;
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 1px;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: github-line;
+                                color: ink;
+                                font-size: 13px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: repo-status;
+                                color: faint;
+                                font-size: 11px;
+                                font-family: "JetBrainsMono Nerd Font";
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        if busy: VerticalLayout {
+                            alignment: center;
+                            Text {
+                                text: spin-frames[spin-frame];
+                                color: accent;
+                                font-size: 15px;
+                                font-family: "JetBrainsMono Nerd Font";
+                                vertical-alignment: center;
+                            }
+                        }
+                        ActionButton {
+                            label: sync-label;
+                            icon: "\u{f021}";
+                            btn-bg: accent;
+                            btn-fg: on-accent;
+                            rad: radius;
+                            h: 32px;
+                            clicked => { github-sync(); }
+                        }
+                        ActionButton {
+                            label: show-repo-details ? "Less" : "Details";
+                            icon: show-repo-details ? "\u{f077}" : "\u{f078}";
+                            btn-bg: bg;
+                            btn-fg: ink;
+                            rad: radius;
+                            h: 32px;
+                            clicked => { show-repo-details = !show-repo-details; }
+                        }
+                    }
+                    if show-repo-details: VerticalLayout {
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                spacing: 3px;
+                                horizontal-stretch: 2;
+                                min-width: 140px;
+                                Text { text: "LOCAL PATH"; color: faint; font-size: 10px; font-weight: 700; }
+                                Field {
+                                    value <=> repo-dir;
+                                    hint: "~/config-data";
+                                    box-bg: bg;
+                                    ink: ink;
+                                    faint: faint;
+                                    accent: accent;
+                                    rad: radius;
+                                }
+                            }
+                            VerticalLayout {
+                                spacing: 3px;
+                                horizontal-stretch: 3;
+                                min-width: 180px;
+                                Text { text: "GITHUB URL (CLONE ONLY)"; color: faint; font-size: 10px; font-weight: 700; }
+                                Field {
+                                    value <=> remote-url;
+                                    hint: "git@github.com:me/config-data.git";
+                                    box-bg: bg;
+                                    ink: ink;
+                                    faint: faint;
+                                    accent: accent;
+                                    rad: radius;
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            ActionButton {
+                                label: "Set up";
+                                icon: "\u{f067}";
+                                btn-bg: bg;
+                                btn-fg: ink;
                                 rad: radius;
-                                toggled(v) => { root.app-toggled(ae.id, v); }
-                                select => { root.activate(ae.id); }
+                                h: 34px;
+                                horizontal-stretch: 1;
+                                clicked => { repo-setup(); }
+                            }
+                            Field {
+                                value <=> restore-path;
+                                hint: ".../zed.bak.123";
+                                box-bg: bg;
+                                ink: ink;
+                                faint: faint;
+                                accent: accent;
+                                rad: radius;
+                                h: 34px;
+                                horizontal-stretch: 2;
+                            }
+                            ActionButton {
+                                label: "Restore";
+                                icon: "\u{f0e2}";
+                                btn-bg: bg;
+                                btn-fg: ink;
+                                rad: radius;
+                                h: 34px;
+                                clicked => { restore(restore-path); }
                             }
                         }
-                    }
-                    ActionButton {
-                        label: "Scan";
-                        icon: "\u{f002}";
-                        btn-bg: accent;
-                        btn-fg: on-accent;
-                        rad: radius;
-                        horizontal-stretch: 1;
-                        clicked => { scan(); }
                     }
                 }
             }
 
-            VerticalLayout {
-                horizontal-stretch: 1;
-                spacing: 8px;
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text {
-                        text: download-mode ? "Aus Repository übernehmen" : app-title;
-                        color: ink;
-                        font-size: 16px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text {
-                        text: download-mode ? "" : app-detail;
-                        color: faint;
-                        font-size: 12px;
-                        vertical-alignment: center;
-                    }
-                    ActionButton {
-                        label: download-mode ? "Upload" : "Download";
-                        icon: download-mode ? "\u{f093}" : "\u{f019}";
-                        btn-bg: surface;
-                        btn-fg: ink;
-                        rad: radius;
-                        h: 30px;
-                        clicked => { mode-toggle(); }
-                    }
-                }
-                if !download-mode: HorizontalLayout {
-                    spacing: 8px;
-                    Text { text: "FILES"; color: faint; font-size: 11px; font-weight: 700; vertical-alignment: center; }
-                    Rectangle { horizontal-stretch: 1; }
-                    ActionButton {
-                        label: "All";
-                        btn-bg: surface;
-                        btn-fg: ink;
-                        rad: radius;
-                        h: 30px;
-                        clicked => { select-all(); }
-                    }
-                    ActionButton {
-                        label: "None";
-                        btn-bg: surface;
-                        btn-fg: ink;
-                        rad: radius;
-                        h: 30px;
-                        clicked => { select-none(); }
-                    }
-                }
-                if !download-mode: Rectangle {
-                    background: surface;
-                    border-radius: radius;
-                    vertical-stretch: 1;
-                    min-height: 150px;
-                    clip: true;
-                    ScrollView {
-                        VerticalLayout {
-                            padding: 8px;
-                            spacing: 2px;
-                            if files.length == 0: Text {
-                                text: "Nothing scanned yet — pick apps on the left, then Scan.";
-                                color: faint;
-                                font-size: 12px;
-                                wrap: word-wrap;
-                            }
-                            for fe[idx] in files: FileRow {
-                                fpath: fe.path;
-                                fchecked: fe.checked;
-                                fnote: fe.note;
-                                fdot: fe.state == 0 ? ok : fe.state == 1 ? warn : fe.state == 2 ? accent : faint;
-                                ink: ink;
-                                faint: faint;
-                                accent: accent;
-                                on-accent: on-accent;
-                                toggled(v) => { file-toggled(idx, v); }
-                            }
-                        }
-                    }
-                }
-                if !download-mode: HorizontalLayout {
-                    spacing: 8px;
-                    ActionButton {
-                        label: push-label;
-                        icon: "\u{f093}";
-                        btn-bg: surface;
-                        btn-fg: ink;
-                        rad: radius;
-                        clicked => { push(active-app); }
-                    }
-                    ActionButton {
-                        label: apply-label;
-                        icon: "\u{f00c}";
-                        btn-bg: accent;
-                        btn-fg: on-accent;
-                        rad: radius;
-                        clicked => { apply(active-app); }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
-                if download-mode: Rectangle {
-                    background: surface;
-                    border-radius: radius;
-                    vertical-stretch: 1;
-                    min-height: 150px;
-                    clip: true;
-                    ScrollView {
-                        VerticalLayout {
-                            padding: 8px;
-                            spacing: 2px;
-                            if repo-files.length == 0: Text {
-                                text: "Noch kein Repository — oben klonen oder anlegen, dann erscheinen hier die Apps daraus.";
-                                color: faint;
-                                font-size: 12px;
-                                wrap: word-wrap;
-                            }
-                            for re[ridx] in repo-files: FileRow {
-                                fpath: re.path;
-                                fchecked: re.checked;
-                                fnote: re.note;
-                                fdot: re.state == 0 ? ok : warn;
-                                ink: ink;
-                                faint: faint;
-                                accent: accent;
-                                on-accent: on-accent;
-                                toggled(v) => { repo-file-toggled(ridx, v); }
-                            }
-                        }
-                    }
-                }
-                if download-mode: HorizontalLayout {
-                    spacing: 8px;
-                    ActionButton {
-                        label: "Übernehmen";
-                        icon: "\u{f019}";
-                        btn-bg: accent;
-                        btn-fg: on-accent;
-                        rad: radius;
-                        clicked => { download(); }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                }
-            }
-        }
+            // content: sidebar + main (flexible for small displays)
+            HorizontalLayout {
+                spacing: 10px;
+                vertical-stretch: 1;
 
-        // log
-        HorizontalLayout {
-            spacing: 8px;
-            VerticalLayout {
-                alignment: center;
-                Icon { glyph: "\u{f120}"; fg: faint; px: 12px; }
-            }
-            Text { text: "LOG"; color: faint; font-size: 11px; font-weight: 700; vertical-alignment: center; }
-        }
-        Rectangle {
-            background: console;
-            border-radius: radius;
-            min-height: 90px;
-            max-height: 130px;
-            clip: true;
-            ScrollView {
+                Rectangle {
+                    background: surface;
+                    border-radius: radius;
+                    preferred-width: 250px;
+                    min-width: 210px;
+                    max-width: 320px;
+                    VerticalLayout {
+                        padding: 10px;
+                        spacing: 6px;
+                        Field {
+                            value <=> app-filter;
+                            hint: "Filter apps…";
+                            box-bg: bg;
+                            ink: ink;
+                            faint: faint;
+                            accent: accent;
+                            rad: radius;
+                            h: 32px;
+                            edited(v) => { root.app-filter-changed(v); }
+                        }
+                        // One scroll region for everything: favorites stay
+                        // pinned on top but never steal space from the rest.
+                        ScrollView {
+                            vertical-stretch: 1;
+                            min-height: 120px;
+                            VerticalLayout {
+                                spacing: 4px;
+                                Text { text: fav-header; color: faint; font-size: 11px; font-weight: 700; }
+                                for ae in fav-apps: AppRow {
+                                    app-name: ae.name;
+                                    app-sub: ae.sub;
+                                    is-active: ae.active;
+                                    is-checked: ae.checked;
+                                    dot: ae.state == 1 ? ok : ae.state == 2 ? warn : faint;
+                                    card-bg: sel-bg;
+                                    hover-bg: sel-bg;
+                                    ink: ink;
+                                    faint: faint;
+                                    accent: accent;
+                                    on-accent: on-accent;
+                                    rad: radius;
+                                    toggled(v) => { root.app-toggled(ae.id, v); }
+                                    select => { root.activate(ae.id); }
+                                }
+                                Text { text: other-header; color: faint; font-size: 11px; font-weight: 700; }
+                                for ae in other-apps: AppRow {
+                                    app-name: ae.name;
+                                    app-sub: ae.sub;
+                                    is-active: ae.active;
+                                    is-checked: ae.checked;
+                                    dot: ae.state == 1 ? ok : ae.state == 2 ? warn : faint;
+                                    card-bg: sel-bg;
+                                    hover-bg: sel-bg;
+                                    ink: ink;
+                                    faint: faint;
+                                    accent: accent;
+                                    on-accent: on-accent;
+                                    rad: radius;
+                                    toggled(v) => { root.app-toggled(ae.id, v); }
+                                    select => { root.activate(ae.id); }
+                                }
+                                if fav-apps.length == 0 && other-apps.length == 0: Text {
+                                    text: "No apps match this filter.";
+                                    color: faint;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        ActionButton {
+                            label: "Scan";
+                            icon: "\u{f002}";
+                            btn-bg: accent;
+                            btn-fg: on-accent;
+                            rad: radius;
+                            horizontal-stretch: 1;
+                            clicked => { scan(); }
+                        }
+                    }
+                }
+
                 VerticalLayout {
-                    padding: 10px;
-                    Text {
-                        text: log-text;
-                        color: ink;
-                        font-family: "JetBrainsMono Nerd Font";
-                        font-size: 12px;
-                        wrap: word-wrap;
+                    horizontal-stretch: 1;
+                    min-width: 300px;
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: download-mode ? "Apply from repository" : app-title;
+                            color: ink;
+                            font-size: 16px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: download-mode ? "" : app-detail;
+                            color: faint;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        ActionButton {
+                            label: download-mode ? "Upload" : "Download";
+                            icon: download-mode ? "\u{f093}" : "\u{f019}";
+                            btn-bg: surface;
+                            btn-fg: ink;
+                            rad: radius;
+                            h: 30px;
+                            clicked => { mode-toggle(); }
+                        }
+                    }
+                    if !download-mode: HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "FILES"; color: faint; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        ActionButton {
+                            label: "All";
+                            btn-bg: surface;
+                            btn-fg: ink;
+                            rad: radius;
+                            h: 30px;
+                            clicked => { select-all(); }
+                        }
+                        ActionButton {
+                            label: "None";
+                            btn-bg: surface;
+                            btn-fg: ink;
+                            rad: radius;
+                            h: 30px;
+                            clicked => { select-none(); }
+                        }
+                    }
+                    if !download-mode: Rectangle {
+                        background: surface;
+                        border-radius: radius;
+                        vertical-stretch: 1;
+                        min-height: 120px;
+                        clip: true;
+                        ScrollView {
+                            VerticalLayout {
+                                padding: 8px;
+                                spacing: 2px;
+                                if files.length == 0: Text {
+                                    text: "Nothing scanned yet — pick apps on the left, then Scan.";
+                                    color: faint;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+                                for fe[idx] in files: FileRow {
+                                    fpath: fe.path;
+                                    fchecked: fe.checked;
+                                    fnote: fe.note;
+                                    fdot: fe.state == 0 ? ok : fe.state == 1 ? warn : fe.state == 2 ? accent : faint;
+                                    ink: ink;
+                                    faint: faint;
+                                    accent: accent;
+                                    on-accent: on-accent;
+                                    toggled(v) => { file-toggled(idx, v); }
+                                }
+                            }
+                        }
+                    }
+                    if !download-mode: HorizontalLayout {
+                        spacing: 8px;
+                        ActionButton {
+                            label: push-label;
+                            icon: "\u{f093}";
+                            btn-bg: surface;
+                            btn-fg: ink;
+                            rad: radius;
+                            clicked => { push(active-app); }
+                        }
+                        ActionButton {
+                            label: apply-label;
+                            icon: "\u{f00c}";
+                            btn-bg: accent;
+                            btn-fg: on-accent;
+                            rad: radius;
+                            clicked => { apply(active-app); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    if download-mode: Rectangle {
+                        background: surface;
+                        border-radius: radius;
+                        vertical-stretch: 1;
+                        min-height: 120px;
+                        clip: true;
+                        ScrollView {
+                            VerticalLayout {
+                                padding: 8px;
+                                spacing: 2px;
+                                if repo-files.length == 0: Text {
+                                    text: "No repository yet — open Details, then Set up.";
+                                    color: faint;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                }
+                                for re[ridx] in repo-files: FileRow {
+                                    fpath: re.path;
+                                    fchecked: re.checked;
+                                    fnote: re.note;
+                                    fdot: re.state == 0 ? ok : warn;
+                                    ink: ink;
+                                    faint: faint;
+                                    accent: accent;
+                                    on-accent: on-accent;
+                                    toggled(v) => { repo-file-toggled(ridx, v); }
+                                }
+                            }
+                        }
+                    }
+                    if download-mode: HorizontalLayout {
+                        spacing: 8px;
+                        ActionButton {
+                            label: "Apply all";
+                            icon: "\u{f019}";
+                            btn-bg: accent;
+                            btn-fg: on-accent;
+                            rad: radius;
+                            clicked => { download(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                }
+            }
+
+            // log (kompakt, damit kleine Displays alles sehen)
+            HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    Icon { glyph: "\u{f120}"; fg: faint; px: 12px; }
+                }
+                Text { text: "LOG"; color: faint; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+            }
+            Rectangle {
+                background: console;
+                border-radius: radius;
+                min-height: 64px;
+                max-height: 110px;
+                clip: true;
+                ScrollView {
+                    VerticalLayout {
+                        padding: 10px;
+                        Text {
+                            text: log-text;
+                            color: ink;
+                            font-family: "JetBrainsMono Nerd Font";
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
                     }
                 }
             }

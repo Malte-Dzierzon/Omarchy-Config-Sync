@@ -78,29 +78,40 @@ pub fn scan_apps_parallel(config_dir: &Path, apps: &[AppSpec]) -> Vec<AppStatus>
     if apps.is_empty() {
         return Vec::new();
     }
+    // Bounded workers: one thread per app thrashes the disk once live
+    // discovery finds dozens of entries — 8 chunks are plenty for dotfiles.
+    // Order still matches the input order.
+    let workers = apps.len().clamp(1, 8);
+    let chunk = apps.len().div_ceil(workers);
     std::thread::scope(|s| {
-        let handles: Vec<_> = apps
-            .iter()
-            .map(|app| s.spawn(move || scan_one(config_dir, app)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| empty_status(&apps_unreachable()))
-            })
-            .collect()
+        let mut handles = Vec::new();
+        let mut start = 0;
+        while start < apps.len() {
+            let end = (start + chunk).min(apps.len());
+            let len = end - start;
+            // Disjoint immutable slices — all borrows outlive the scope.
+            let slice = &apps[start..end];
+            handles.push((
+                start,
+                len,
+                s.spawn(move || {
+                    slice
+                        .iter()
+                        .map(|app| scan_one(config_dir, app))
+                        .collect::<Vec<_>>()
+                }),
+            ));
+            start = end;
+        }
+        let mut out = Vec::with_capacity(apps.len());
+        for (start, len, h) in handles {
+            match h.join() {
+                Ok(mut v) => out.append(&mut v),
+                Err(_) => out.extend(apps[start..start + len].iter().map(empty_status)),
+            }
+        }
+        out
     })
-}
-
-// Fallback status if a scan thread ever panics (must never crash the GUI).
-fn apps_unreachable() -> AppSpec {
-    AppSpec {
-        id: "?".to_string(),
-        label: "scan failed".to_string(),
-        rel_paths: vec![],
-        exclude_files: vec![],
-    }
 }
 
 /// Names of all other top-level entries in config dir (read-only, for the picker).

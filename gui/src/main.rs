@@ -88,13 +88,22 @@ fn app_title(id: &str) -> String {
 
 /// (favorites, rest) sidebar models. `keep` preserves checks + active state
 /// across rescans (discovery may find new entries at any time).
+/// `needle` filters by label/id (case-insensitive); empty matches all.
 fn sidebar_models(
     cfg: &Path,
     keep: &HashMap<String, (bool, bool)>,
+    needle: &str,
 ) -> (Vec<AppEntry>, Vec<AppEntry>) {
+    let needle = needle.to_lowercase();
     let mut favs = Vec::new();
     let mut rest = Vec::new();
     for a in ocs_core::apps::discover_apps(cfg) {
+        if !needle.is_empty()
+            && !a.label.to_lowercase().contains(&needle)
+            && !a.id.to_lowercase().contains(&needle)
+        {
+            continue;
+        }
         // Favorites on, everything else off: enable extra apps explicitly.
         let (checked, active) = keep
             .get(&a.id)
@@ -118,8 +127,22 @@ fn sidebar_models(
 }
 
 fn set_sidebar(ui: &AppWindow, favs: Vec<AppEntry>, rest: Vec<AppEntry>) {
+    ui.set_fav_header(if ui.get_app_filter().trim().is_empty() {
+        "FAVORITES".into()
+    } else {
+        format!("FAVORITES ({})", favs.len()).into()
+    });
+    ui.set_other_header(format!("ALL APPS ({})", rest.len()).into());
     ui.set_fav_apps(ModelRc::new(VecModel::from(favs)));
     ui.set_other_apps(ModelRc::new(VecModel::from(rest)));
+}
+
+/// Rebuild the sidebar from persistent `keep` state + the live filter text.
+fn rebuild_sidebar(ui: &AppWindow, keep: &HashMap<String, (bool, bool)>) {
+    let (cfg, _) = config_and_repo(ui);
+    let needle = ui.get_app_filter().to_string();
+    let (favs, rest) = sidebar_models(&cfg, keep, needle.trim());
+    set_sidebar(ui, favs, rest);
 }
 
 fn snapshot_sidebar(ui: &AppWindow) -> HashMap<String, (bool, bool)> {
@@ -132,6 +155,12 @@ fn snapshot_sidebar(ui: &AppWindow) -> HashMap<String, (bool, bool)> {
         }
     }
     map
+}
+
+/// Merge the visible rows into the persistent sidebar state, so filtered-out
+/// apps keep their checks/active flag across rescans and filter changes.
+fn persist_sidebar(ui: &AppWindow, state: &RefCell<HashMap<String, (bool, bool)>>) {
+    state.borrow_mut().extend(snapshot_sidebar(ui));
 }
 
 fn for_each_app_row(ui: &AppWindow, mut f: impl FnMut(&ModelRc<AppEntry>, usize, AppEntry)) {
@@ -187,6 +216,37 @@ fn remember(ui: &AppWindow, checks: &Rc<RefCell<HashMap<String, HashSet<PathBuf>
     checks
         .borrow_mut()
         .insert(ui.get_active_app().to_string(), read_checks(ui));
+}
+
+/// Checked app ids in the download picker (repo-files model).
+fn read_repo_checks(ui: &AppWindow) -> HashSet<String> {
+    let m = ui.get_repo_files();
+    let mut set = HashSet::new();
+    for i in 0..m.row_count() {
+        if let Some(r) = m.row_data(i) {
+            if r.checked {
+                set.insert(r.path.to_string());
+            }
+        }
+    }
+    set
+}
+
+/// Restore download-picker checks after a rebuild (e.g. post-sync refresh).
+fn restore_repo_checks(ui: &AppWindow, keep: &HashSet<String>) {
+    if keep.is_empty() {
+        return;
+    }
+    let m = ui.get_repo_files();
+    for i in 0..m.row_count() {
+        if let Some(mut r) = m.row_data(i) {
+            let want = keep.contains(r.path.as_str());
+            if r.checked != want {
+                r.checked = want;
+                m.set_row_data(i, r);
+            }
+        }
+    }
 }
 
 /// "N of M checked" + counted Push/Apply labels from the visible checklist.
@@ -376,14 +436,12 @@ fn checked_repo_apps(ui: &AppWindow) -> Vec<String> {
 
 fn refresh_repo(ui: &AppWindow) {
     if ui.get_repo_dir().trim().is_empty() {
-        ui.set_repo_status("no repository configured".into());
+        ui.set_repo_status("no repository path set".into());
         return;
     }
     let repo = expand(&ui.get_repo_dir());
     match git::repo_status(&repo) {
-        Ok(st) if !st.is_repo => {
-            ui.set_repo_status("not a repository — Clone or Init below".into())
-        }
+        Ok(st) if !st.is_repo => ui.set_repo_status("no repository — open Details → Set up".into()),
         Ok(st) => {
             let health = if st.clean { "clean" } else { "dirty" };
             let remote = if st.remote_url.is_empty() {
@@ -402,6 +460,87 @@ fn refresh_repo(ui: &AppWindow) {
     }
 }
 
+/// Minimal GitHub header: one headline + status line, everything else
+/// automatic. Welcome stays visible until the first browser login
+/// (unless the user explicitly chose offline — tracked in UI state).
+/// Takes a probed [`git::GhAuth`] so callers that already probed (startup,
+/// auto-tick) don't spawn `gh` twice.
+fn refresh_github_with(ui: &AppWindow, auth: &git::GhAuth) {
+    ui.set_github_connected(auth.logged_in);
+    ui.set_github_user(auth.user.clone().into());
+    let repo = expand(&ui.get_repo_dir());
+    let state = git::setup_state_for(auth.logged_in, &repo);
+    let dismissed = ui.get_welcome_dismissed();
+    if !dismissed && state == git::SetupState::NeedLogin {
+        ui.set_show_welcome(true);
+    } else if state != git::SetupState::NeedLogin {
+        ui.set_show_welcome(false);
+    }
+    if !auth.logged_in {
+        ui.set_github_line("Not signed in to GitHub".into());
+        ui.set_repo_status("Sign in in the browser — then everything runs automatically".into());
+        ui.set_sync_label("Sync".into());
+        return;
+    }
+    let repo_name = repo
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config-data")
+        .to_string();
+    if state == git::SetupState::NeedRepo {
+        ui.set_github_line(format!("{user} · no repository yet", user = auth.user).into());
+        ui.set_repo_status(format!("{repo_name} will be created during setup").into());
+        ui.set_sync_label("Sync".into());
+        return;
+    }
+    // Ready: headline = who + where + flow, details stay in repo-status.
+    refresh_repo(ui);
+    let flow: String = ui.get_repo_status().to_string();
+    let who = if auth.user.is_empty() {
+        "GitHub".to_string()
+    } else {
+        auth.user.clone()
+    };
+    // Keep the headline short: user · repo · branch-ish flow prefix.
+    let short = flow.split(" · ").next().unwrap_or(flow.as_str());
+    ui.set_github_line(format!("{who} · {repo_name} · {short}").into());
+    ui.set_sync_label("Sync".into());
+}
+
+fn refresh_github(ui: &AppWindow) {
+    refresh_github_with(ui, &git::gh_auth_status());
+}
+
+/// Shared scan body (startup + Scan button + post-login): re-discovers apps,
+/// refreshes dots/summary/file lists and logs a compact summary. Read-only.
+/// The log reuses the refreshed sidebar rows — no second compare pass.
+/// A scan always clears the filter so the summary covers every app.
+fn do_scan(
+    ui: &AppWindow,
+    checks: &HashMap<String, HashSet<PathBuf>>,
+    state: &RefCell<HashMap<String, (bool, bool)>>,
+) {
+    persist_sidebar(ui, state);
+    ui.set_app_filter("".into());
+    rebuild_sidebar(ui, &state.borrow());
+    let (cfg, repo) = config_and_repo(ui);
+    refresh_all(ui);
+    if ui.get_download_mode() {
+        show_repo_apps(ui, &cfg, &repo);
+    } else {
+        show_app(ui, &cfg, &repo, ui.get_active_app().as_str(), checks);
+    }
+    let mut log = String::from("scan (read-only):\n");
+    for_each_app_row(ui, |_, _, r| {
+        if r.checked {
+            log.push_str(&format!("- {}: {}\n", r.id, r.sub));
+        }
+    });
+    let others = scanner::scan_other_entries(&cfg, &ocs_core::apps::builtin_apps());
+    log.push_str(&format!("other ~/.config entries: {}\n", others.len()));
+    ui.set_log_text(log.into());
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     apply_theme(&ui, &theme::load());
@@ -418,14 +557,26 @@ fn main() -> Result<(), slint::PlatformError> {
             .into(),
     );
     let (cfg0, _) = config_and_repo(&ui);
-    let (favs, rest) = sidebar_models(&cfg0, &HashMap::new());
+    let (favs, rest) = sidebar_models(&cfg0, &HashMap::new(), "");
     set_sidebar(&ui, favs, rest);
     ui.set_log_text("Pick apps on the left, set a repository above, then Scan.".into());
-    refresh_repo(&ui);
 
     let checks: Rc<RefCell<HashMap<String, HashSet<PathBuf>>>> =
         Rc::new(RefCell::new(HashMap::new()));
     let theme_fp: Rc<RefCell<String>> = Rc::new(RefCell::new(theme::fingerprint_live()));
+    // Persistent sidebar state (checks + active app), independent of the
+    // visible filter: filtered-out apps keep their state across rescans.
+    let app_state: Rc<RefCell<HashMap<String, (bool, bool)>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
+    // Minimal startup: exactly one `gh` probe, then auto-scan so the UI
+    // is never empty. Welcome stays visible until the first login.
+    refresh_github_with(&ui, &git::gh_auth_status());
+    do_scan(&ui, &checks.borrow(), &app_state);
+    if ui.get_show_welcome() {
+        ui.set_welcome_detail("Never signed in — one click opens terminal + browser.".into());
+    }
+    ui.set_ready(true);
 
     // Live theme: re-apply silently when the Omarchy theme changes.
     {
@@ -464,39 +615,11 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let ui_handle = ui.as_weak();
         let checks = checks.clone();
+        let app_state = app_state.clone();
         ui.on_scan(move || {
             let ui = ui_handle.unwrap();
-            let (cfg, repo) = config_and_repo(&ui);
-            let keep = snapshot_sidebar(&ui);
-            let (favs, rest) = sidebar_models(&cfg, &keep);
-            set_sidebar(&ui, favs, rest);
-            let sel = selected_ids(&ui);
-            refresh_all(&ui);
-            if ui.get_download_mode() {
-                show_repo_apps(&ui, &cfg, &repo);
-            } else {
-                show_app(
-                    &ui,
-                    &cfg,
-                    &repo,
-                    ui.get_active_app().as_str(),
-                    &checks.borrow(),
-                );
-            }
-            let mut log = String::from("scan (read-only):\n");
-            for id in &sel {
-                let app = ocs_core::apps::resolve_app(&cfg, id);
-                let cmp = store::compare(&cfg, &repo.join(&app.id), &app, None).unwrap_or_default();
-                let synced = cmp
-                    .iter()
-                    .filter(|c| c.state == store::FileState::Synced)
-                    .count();
-                log.push_str(&format!("- {id}: {synced}/{} synced\n", cmp.len()));
-            }
-            let others = scanner::scan_other_entries(&cfg, &ocs_core::apps::builtin_apps());
-            log.push_str(&format!("other ~/.config entries: {}\n", others.len()));
-            ui.set_log_text(log.into());
-            refresh_repo(&ui);
+            do_scan(&ui, &checks.borrow(), &app_state);
+            refresh_github(&ui);
         });
     }
 
@@ -504,6 +627,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let ui_handle = ui.as_weak();
         let checks = checks.clone();
+        let app_state = app_state.clone();
         ui.on_activate(move |app_id| {
             let ui = ui_handle.unwrap();
             remember(&ui, &checks);
@@ -512,15 +636,17 @@ fn main() -> Result<(), slint::PlatformError> {
                 r.active = r.id.as_str() == id;
                 m.set_row_data(i, r);
             });
+            persist_sidebar(&ui, &app_state);
             ui.set_active_app(id.clone().into());
             let (cfg, repo) = config_and_repo(&ui);
             show_app(&ui, &cfg, &repo, &id, &checks.borrow());
         });
     }
 
-    // Sidebar checkbox.
+    // Sidebar checkbox (dots + summary refresh live for instant feedback).
     {
         let ui_handle = ui.as_weak();
+        let app_state = app_state.clone();
         ui.on_app_toggled(move |app_id, v| {
             let ui = ui_handle.unwrap();
             for_each_app_row(&ui, |m, i, mut r| {
@@ -529,6 +655,20 @@ fn main() -> Result<(), slint::PlatformError> {
                     m.set_row_data(i, r);
                 }
             });
+            persist_sidebar(&ui, &app_state);
+            refresh_all(&ui);
+        });
+    }
+
+    // Sidebar live filter (state-preserving: hidden apps keep checks).
+    {
+        let ui_handle = ui.as_weak();
+        let app_state = app_state.clone();
+        ui.on_app_filter_changed(move |_needle| {
+            let ui = ui_handle.unwrap();
+            persist_sidebar(&ui, &app_state);
+            rebuild_sidebar(&ui, &app_state.borrow());
+            refresh_all(&ui);
         });
     }
 
@@ -544,7 +684,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let (cfg, repo) = config_and_repo(&ui);
             if now {
                 show_repo_apps(&ui, &cfg, &repo);
-                ui.set_log_text("download mode — tick repo apps, then Übernehmen".into());
+                ui.set_log_text("download mode — tick repo apps, then Apply all".into());
             } else {
                 show_app(
                     &ui,
@@ -632,7 +772,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             refresh_all(&ui);
             show_app(&ui, &cfg, &repo, &id, &checks.borrow());
-            refresh_repo(&ui);
+            refresh_github(&ui);
         });
     }
 
@@ -777,7 +917,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 Ok(_) => ui.set_log_text("checked for updates — status is vs remote now".into()),
                 Err(e) => ui.set_log_text(format!("update check failed:\n{e}").into()),
             }
-            refresh_repo(&ui);
+            refresh_github(&ui);
         });
     }
     {
@@ -805,7 +945,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 Err(e) => ui.set_log_text(format!("pull failed:\n{e}").into()),
             }
-            refresh_repo(&ui);
+            refresh_github(&ui);
         });
     }
     {
@@ -817,7 +957,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 Ok(_) => ui.set_log_text("pushed".into()),
                 Err(e) => ui.set_log_text(format!("push failed:\n{e}").into()),
             }
-            refresh_repo(&ui);
+            refresh_github(&ui);
         });
     }
     {
@@ -840,7 +980,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 Err(e) => ui.set_log_text(format!("clone failed:\n{e}").into()),
             }
-            refresh_repo(&ui);
+            refresh_github(&ui);
         });
     }
     {
@@ -855,7 +995,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             if let Err(e) = git::init_repo(&repo) {
                 ui.set_log_text(format!("init failed:\n{e}").into());
-                refresh_repo(&ui);
+                refresh_github(&ui);
                 return;
             }
             // Autonomous first snapshot: everything of the checked apps.
@@ -876,7 +1016,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                     Err(e) => {
                         ui.set_log_text(format!("snapshot {id} failed:\n{e}").into());
-                        refresh_repo(&ui);
+                        refresh_github(&ui);
                         return;
                     }
                 }
@@ -911,7 +1051,279 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             ui.set_log_text(log.into());
             refresh_all(&ui);
-            refresh_repo(&ui);
+            refresh_github(&ui);
+        });
+    }
+
+    // WELCOME + BROWSER LOGIN: one button, the rest is automatic.
+    {
+        let ui_handle = ui.as_weak();
+        ui.on_github_login(move || {
+            let ui = ui_handle.unwrap();
+            match git::launch_gh_login() {
+                Ok(msg) => {
+                    ui.set_welcome_detail(msg.into());
+                    ui.set_log_text(
+                        "Browser login started — confirm in terminal + browser, then “I'm signed in”."
+                            .into(),
+                    );
+                }
+                Err(e) => {
+                    ui.set_welcome_detail(
+                        format!("{e} — or run in a terminal: gh auth login --web").into(),
+                    );
+                    ui.set_log_text(
+                        format!(
+                            "login start failed:\n{e}\nTip: run `gh auth login --web` in a terminal, then “I'm signed in”."
+                        )
+                        .into(),
+                    );
+                }
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        let checks = checks.clone();
+        let app_state = app_state.clone();
+        ui.on_github_recheck(move || {
+            let ui = ui_handle.unwrap();
+            refresh_github(&ui);
+            if ui.get_github_connected() {
+                ui.set_show_welcome(false);
+                do_scan(&ui, &checks.borrow(), &app_state);
+                let who = ui.get_github_user().to_string();
+                ui.set_log_text(
+                    format!("signed in as {who} — set up the repository under Details if needed.")
+                        .into(),
+                );
+            } else {
+                ui.set_welcome_detail(
+                    "Not signed in yet — finish the browser window, then tap again.".into(),
+                );
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        ui.on_welcome_dismiss(move || {
+            let ui = ui_handle.unwrap();
+            ui.set_welcome_dismissed(true);
+            ui.set_show_welcome(false);
+            ui.set_log_text(
+                "Offline mode — Scan/Push/Apply work locally, Sync needs a login later.".into(),
+            );
+        });
+    }
+
+    // SYNC: one button instead of check-updates/pull/push. Runs in a
+    // background thread so the UI (and the spinner) stays alive; the
+    // completion handler runs back on the UI thread. Only `Send` data
+    // crosses threads — checklist state is re-read from the UI on arrival.
+    {
+        let ui_handle = ui.as_weak();
+        ui.on_github_sync(move || {
+            let ui = ui_handle.unwrap();
+            if ui.get_busy() {
+                return;
+            }
+            let repo = expand(&ui.get_repo_dir());
+            if git::setup_state_for(ui.get_github_connected(), &repo) != git::SetupState::Ready {
+                ui.set_log_text("No repository yet — open Details → Set up first.".into());
+                ui.set_show_repo_details(true);
+                return;
+            }
+            ui.set_busy(true);
+            ui.set_sync_label("Syncing".into());
+            let weak = ui.as_weak();
+            std::thread::spawn(move || {
+                let res = git::sync_repo(&repo);
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = weak.upgrade() else {
+                        return;
+                    };
+                    ui.set_busy(false);
+                    match res {
+                        Ok(s) => {
+                            ui.set_log_text(format!("sync: {s}").into());
+                            refresh_all(&ui);
+                            let (cfg, repo) = config_and_repo(&ui);
+                            if ui.get_download_mode() {
+                                let keep = read_repo_checks(&ui);
+                                show_repo_apps(&ui, &cfg, &repo);
+                                restore_repo_checks(&ui, &keep);
+                            } else {
+                                let active = ui.get_active_app().to_string();
+                                let mut one = HashMap::new();
+                                one.insert(active.clone(), read_checks(&ui));
+                                show_app(&ui, &cfg, &repo, &active, &one);
+                            }
+                        }
+                        Err(e) => ui.set_log_text(format!("sync failed:\n{e}").into()),
+                    }
+                    refresh_github(&ui);
+                });
+            });
+        });
+    }
+
+    // SET UP (smart): clone when URL + target missing, else init + publish.
+    // Repos that already exist are just synced.
+    {
+        let ui_handle = ui.as_weak();
+        ui.on_repo_setup(move || {
+            let ui = ui_handle.unwrap();
+            let url = ui.get_remote_url().trim().to_string();
+            let dest = expand(&ui.get_repo_dir());
+            if dest.join(".git").exists() {
+                match git::sync_repo(&dest) {
+                    Ok(s) => ui.set_log_text(format!("already set up — sync: {s}").into()),
+                    Err(e) => ui.set_log_text(format!("sync failed:\n{e}").into()),
+                }
+                refresh_github(&ui);
+                return;
+            }
+            if !url.is_empty() && !dest.exists() {
+                match git::clone_repo(&url, &dest) {
+                    Ok(_) => {
+                        ui.set_log_text(format!("cloned {url} — download mode").into());
+                        let (cfg, _) = config_and_repo(&ui);
+                        ui.set_download_mode(true);
+                        show_repo_apps(&ui, &cfg, &dest);
+                        refresh_all(&ui);
+                    }
+                    Err(e) => ui.set_log_text(format!("clone failed:\n{e}").into()),
+                }
+                refresh_github(&ui);
+                return;
+            }
+            let (cfg, repo) = config_and_repo(&ui);
+            if ui.get_repo_dir().trim().is_empty() {
+                ui.set_log_text("Set a local path in Details, or a GitHub URL to clone.".into());
+                return;
+            }
+            if !git::gh_auth_status().logged_in && url.is_empty() {
+                ui.set_log_text(
+                    "Local-only without login — sign in in the browser first, then Set up."
+                        .into(),
+                );
+                return;
+            }
+            if let Err(e) = git::init_repo(&repo) {
+                ui.set_log_text(format!("init failed:\n{e}").into());
+                refresh_github(&ui);
+                return;
+            }
+            let sel = selected_ids(&ui);
+            let mut total = 0usize;
+            let mut done = 0usize;
+            for id in &sel {
+                let app = ocs_core::apps::resolve_app(&cfg, id);
+                let all: HashSet<PathBuf> = store::list_local_rels(&cfg, &app)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|f| f.rel)
+                    .collect();
+                match store::snapshot_selected(&cfg, &repo.join(&app.id), &app, &all) {
+                    Ok(n) => {
+                        total += n;
+                        done += 1;
+                    }
+                    Err(e) => {
+                        ui.set_log_text(format!("snapshot {id} failed:\n{e}").into());
+                        refresh_github(&ui);
+                        return;
+                    }
+                }
+            }
+            let mut log = format!("set up — {done} apps, {total} files\n");
+            match git::commit_all(&repo, "initial sync") {
+                Ok(m) => log.push_str(&format!("commit: {m}\n")),
+                Err(e) => log.push_str(&format!("commit failed: {e}\n")),
+            }
+            if url.is_empty() {
+                let name = repo
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("config-data")
+                    .to_string();
+                match git::gh_create_repo(&repo, &name)
+                    .and_then(|_| git::push_upstream(&repo))
+                {
+                    Ok(_) => log.push_str("GitHub repo created + published"),
+                    Err(e) => log.push_str(&format!(
+                        "local repo ready, GitHub create failed:\n{e}\nTip: create the empty repo on github.com, paste its URL in Details, Set up again"
+                    )),
+                }
+            } else {
+                match git::set_remote(&repo, &url).and_then(|_| git::push_upstream(&repo)) {
+                    Ok(_) => log.push_str("remote attached + published to GitHub"),
+                    Err(e) => log.push_str(&format!(
+                        "local repo ready, publish failed (create the empty GitHub repo first?):\n{e}"
+                    )),
+                }
+            }
+            ui.set_log_text(log.into());
+            refresh_all(&ui);
+            refresh_github(&ui);
+        });
+    }
+
+    // AUTO in the background: login detection + quiet fetch every 30s.
+    // Exactly one `gh` probe per tick; detection keeps running in
+    // offline mode so a later login is noticed immediately.
+    // Skipped while a sync is in flight (busy) to avoid overlapping git.
+    {
+        let ui_handle = ui.as_weak();
+        let checks = checks.clone();
+        let app_state = app_state.clone();
+        ui.on_auto_tick(move || {
+            let ui = ui_handle.unwrap();
+            if ui.get_busy() {
+                return;
+            }
+            let was = ui.get_github_connected();
+            let auth = git::gh_auth_status();
+            if auth.logged_in != was {
+                refresh_github_with(&ui, &auth);
+                if auth.logged_in {
+                    do_scan(&ui, &checks.borrow(), &app_state);
+                    ui.set_log_text(
+                        format!(
+                            "signed in as {} — welcome! Set up the repository under Details if needed.",
+                            auth.user
+                        )
+                        .into(),
+                    );
+                }
+                return;
+            }
+            if !auth.logged_in {
+                return;
+            }
+            if git::setup_state_for(true, &expand(&ui.get_repo_dir()))
+                != git::SetupState::Ready
+            {
+                return;
+            }
+            let repo = expand(&ui.get_repo_dir());
+            let _ = git::fetch(&repo); // quiet; failures surface in the status line
+            refresh_github_with(&ui, &auth);
+            if !ui.get_show_welcome() {
+                refresh_all(&ui);
+                let (cfg, rp) = config_and_repo(&ui);
+                if ui.get_download_mode() {
+                    show_repo_apps(&ui, &cfg, &rp);
+                } else {
+                    show_app(
+                        &ui,
+                        &cfg,
+                        &rp,
+                        ui.get_active_app().as_str(),
+                        &checks.borrow(),
+                    );
+                }
+            }
         });
     }
 

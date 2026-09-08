@@ -290,6 +290,7 @@ pub fn list_repo_apps(repo: &Path) -> Vec<RepoApp> {
 
 /// Apply a preview plan: backup each affected existing target, then copy.
 /// Backup = rename `<target>` to `<target>.bak.<epoch>`; aborts on backup failure.
+/// Plans without changes are a no-op: no backup litter, nothing rewritten.
 pub fn apply_plan(
     config_dir: &Path,
     repo_app_dir: &Path,
@@ -303,6 +304,10 @@ pub fn apply_plan(
         unchanged: 0,
         merged_back: 0,
     };
+    if plan.iter().all(|o| o.kind == OpKind::Unchanged) {
+        report.unchanged = plan.len();
+        return Ok(report);
+    }
     // 1. Backup every existing top-level target this app touches (once each).
     for (bak, _) in backup_targets(config_dir, app)? {
         report.backed_up.push(bak.display().to_string());
@@ -337,6 +342,15 @@ pub fn apply_plan_selected(
         unchanged: 0,
         merged_back: 0,
     };
+    // No-op fast path: nothing selected that would change — leave the live
+    // tree (and the backup list) untouched instead of rename+copy churn.
+    let actionable = plan
+        .iter()
+        .any(|o| o.kind != OpKind::Unchanged && selected.contains(&o.rel));
+    if !actionable {
+        report.unchanged = plan.iter().filter(|o| selected.contains(&o.rel)).count();
+        return Ok(report);
+    }
     // 1. Same whole-target backup as a full apply (rename = no loss).
     let pairs = backup_targets(config_dir, app)?;
     for (bak, _) in &pairs {
@@ -625,7 +639,39 @@ fn files_differ(a: &Path, b: &Path) -> io::Result<bool> {
     if ma.len() != mb.len() {
         return Ok(true);
     }
-    Ok(std::fs::read(a)? != std::fs::read(b)?)
+    if ma.len() == 0 {
+        return Ok(false);
+    }
+    // Chunked compare: bounded memory + early exit on the first
+    // differing block (the old code read both files fully every time).
+    const CHUNK: usize = 64 * 1024;
+    let mut fa = std::fs::File::open(a)?;
+    let mut fb = std::fs::File::open(b)?;
+    let mut ba = vec![0u8; CHUNK];
+    let mut bb = vec![0u8; CHUNK];
+    loop {
+        let na = read_full(&mut fa, &mut ba)?;
+        let nb = read_full(&mut fb, &mut bb)?;
+        if na != nb || ba[..na] != bb[..nb] {
+            return Ok(true);
+        }
+        if na == 0 {
+            return Ok(false);
+        }
+    }
+}
+
+/// Fill `buf`, short only at EOF. Returns bytes read.
+fn read_full(f: &mut std::fs::File, buf: &mut [u8]) -> io::Result<usize> {
+    use std::io::Read;
+    let mut got = 0;
+    while got < buf.len() {
+        match f.read(&mut buf[got..])? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    Ok(got)
 }
 
 /// Copy one file or symlink. Creates parent dirs. Overwrites the exact
@@ -888,5 +934,52 @@ mod tests {
             std::fs::read_to_string(cfg.join("hypr/monitors.lua")).unwrap(),
             "local-mon"
         );
+    }
+
+    #[test]
+    fn noop_apply_creates_no_backup_litter() {
+        use std::collections::HashSet;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let repo = tmp.path().join("repo/zed");
+        write(&cfg.join("zed/settings.json"), "same");
+        write(&repo.join("settings.json"), "same");
+        let app = find_app("zed").unwrap();
+        let plan = preview(&cfg, &repo, &app).unwrap();
+        assert!(plan.iter().all(|o| o.kind == OpKind::Unchanged));
+        let r = apply_plan(&cfg, &repo, &app, &plan).unwrap();
+        assert_eq!(r.written, 0);
+        assert_eq!(r.unchanged, plan.len());
+        assert!(r.backed_up.is_empty());
+        assert!(list_backups(&cfg, &app).is_empty());
+        // selective variant behaves the same
+        let sel: HashSet<PathBuf> = [PathBuf::from("settings.json")].into();
+        let r2 = apply_plan_selected(&cfg, &repo, &app, &plan, &sel).unwrap();
+        assert_eq!(r2.written, 0);
+        assert_eq!(r2.merged_back, 0);
+        assert!(r2.backed_up.is_empty());
+        assert!(list_backups(&cfg, &app).is_empty());
+    }
+
+    #[test]
+    fn chunked_diff_finds_late_difference() {
+        // 200 KB identical prefix, last byte differs.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.bin");
+        let b = tmp.path().join("b.bin");
+        let mut v = vec![0xABu8; 200 * 1024];
+        std::fs::write(&a, &v).unwrap();
+        v[200 * 1024 - 1] = 0xCD;
+        std::fs::write(&b, &v).unwrap();
+        assert!(super::files_differ(&a, &b).unwrap());
+        std::fs::write(&b, vec![0xABu8; 200 * 1024]).unwrap();
+        assert!(!super::files_differ(&a, &b).unwrap());
+        // empty files are equal, missing file errors (caller maps to Modified)
+        let e = tmp.path().join("e");
+        std::fs::write(&e, b"").unwrap();
+        let e2 = tmp.path().join("e2");
+        std::fs::write(&e2, b"").unwrap();
+        assert!(!super::files_differ(&e, &e2).unwrap());
+        assert!(super::files_differ(&e, &tmp.path().join("nope")).is_err());
     }
 }
