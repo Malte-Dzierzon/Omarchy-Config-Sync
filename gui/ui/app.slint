@@ -177,18 +177,21 @@ component ActionButton inherits Rectangle {
     in property <color> btn-fg;
     in property <length> rad;
     in property <length> h: 34px;
+    in property <bool> enabled: true;
     callback clicked();
     height: h;
     min-width: 72px;
     border-radius: rad;
-    background: ta.pressed ? btn-bg.darker(0.15) : ta.has-hover ? btn-bg.brighter(0.08) : btn-bg;
+    opacity: enabled ? 1 : 0.45;
+    background: !enabled ? btn-bg : ta.pressed ? btn-bg.darker(0.15) : ta.has-hover ? btn-bg.brighter(0.08) : btn-bg;
     animate background { duration: 150ms; easing: ease-out; }
     ta := TouchArea {
         x: 0;
         y: 0;
         width: parent.width;
         height: parent.height;
-        mouse-cursor: pointer;
+        mouse-cursor: enabled ? pointer : default;
+        enabled: root.enabled;
         clicked => { root.clicked(); }
     }
     HorizontalLayout {
@@ -232,8 +235,9 @@ component AppRow inherits Rectangle {
     callback select();
     height: 58px;
     border-radius: rad;
+    // No background animation: the nested checkbox hover flapped has-hover
+    // and restarted the fade (visible blinking). Hover is instant instead.
     background: is-active ? card-bg : row-ta.has-hover ? hover-bg.with-alpha(0.35) : transparent;
-    animate background { duration: 150ms; easing: ease-out; }
     row-ta := TouchArea {
         x: 0;
         y: 0;
@@ -327,6 +331,10 @@ export component AppWindow inherits Window {
     in-out property <bool> show-welcome: true;
     in-out property <bool> welcome-dismissed: false;
     in-out property <string> welcome-detail: "";
+    in-out property <bool> welcome-never: false;
+    // In-app device login: code shown here while `gh` waits for the browser.
+    in-out property <string> login-code: "";
+    in-out property <bool> login-busy: false;
     // Subtle loading state: Braille spinner frames driven by a timer below.
     // Only visible during network sync (local ops stay instant).
     in-out property <bool> busy: false;
@@ -338,17 +346,34 @@ export component AppWindow inherits Window {
     in-out property <string> other-header: "ALL APPS";
     // One-time fade-in, set from Rust after startup.
     in-out property <bool> ready: false;
+    // Set by the one-shot boot timer; gates the startup scan.
+    property <bool> booted: false;
     in-out property <string> log-text: "";
     in-out property <string> active-app: "zed";
     in-out property <string> app-title: "Zed";
     in-out property <string> app-detail: "pick apps on the left, then Scan";
     in-out property <string> push-label: "Push";
-    in-out property <string> apply-label: "Apply";
     in-out property <bool> download-mode: false;
+    in-out property <bool> show-ssh-fix: false;
+    // SSH readiness probe: 0 checking, 1 ok, 2 failed.
+    in-out property <int> ssh-state: 0;
+    in-out property <string> ssh-detail: "SSH: checking…";
+    // Restore picker (Download mode): backups to choose from.
+    in-out property <bool> show-restore: false;
+    in-out property <string> restore-picked: "";
+    in-out property <[FileEntry]> backup-items;
+    in-out property <string> copy-label: "Copy";
     in-out property <[AppEntry]> fav-apps;
     in-out property <[AppEntry]> other-apps;
     in-out property <[FileEntry]> files;
     in-out property <[FileEntry]> repo-files;
+    // Selection + confirm state (Safety: Apply never runs without preview + ok).
+    in-out property <bool> has-selection: false;
+    in-out property <bool> has-repo-selection: false;
+    in-out property <bool> show-confirm: false;
+    in-out property <string> confirm-title: "";
+    in-out property <string> confirm-detail: "";
+    in-out property <string> confirm-ok-label: "Backup + Apply";
 
     callback scan();
     callback activate(string);
@@ -359,14 +384,24 @@ export component AppWindow inherits Window {
     callback select-all();
     callback select-none();
     callback push(string);
-    callback apply(string);
     callback download();
     callback mode-toggle();
     callback restore(string);
+    callback confirm-accept();
+    callback confirm-cancel();
     // Minimal GitHub UX: ein Sync + ein Setup statt 5 Buttons.
     callback github-sync();
     callback repo-setup();
+    callback fix-ssh-remote();
+    callback toggle-details();
+    callback github-relogin();
+    callback toggle-restore();
+    callback backup-pick(string);
+    callback copy-log();
+    callback copy-code();
     callback github-login();
+    callback cancel-login();
+    callback open-device-page();
     callback github-recheck();
     callback welcome-dismiss();
     // Old single-action callbacks stay wired for compatibility,
@@ -378,6 +413,9 @@ export component AppWindow inherits Window {
     callback repo-init();
     callback theme-tick();
     callback auto-tick();
+    // One-shot boot: fires once the event loop runs, so the startup scan
+    // (and everything it invokes) can never be lost before `run()`.
+    callback startup();
 
     VerticalLayout {
         padding: 12px;
@@ -389,6 +427,14 @@ export component AppWindow inherits Window {
             interval: 2500ms;
             running: true;
             triggered => { root.theme-tick(); }
+        }
+        Timer {
+            interval: 120ms;
+            running: !root.booted;
+            triggered => {
+                root.booted = true;
+                root.startup();
+            }
         }
         Timer {
             interval: 30000ms;
@@ -494,16 +540,65 @@ export component AppWindow inherits Window {
                             wrap: word-wrap;
                             visible: welcome-detail != "";
                         }
+                        if login-code != "": VerticalLayout {
+                            spacing: 2px;
+                            Text {
+                                text: "YOUR ONE-TIME CODE";
+                                color: faint;
+                                font-size: 10px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                            }
+                            Text {
+                                text: login-code;
+                                color: ink;
+                                font-size: 28px;
+                                font-weight: 800;
+                                font-family: "JetBrainsMono Nerd Font";
+                                horizontal-alignment: center;
+                            }
+                            Text {
+                                text: "type it at the opened page, then approve";
+                                color: faint;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                                wrap: word-wrap;
+                            }
+                        }
                         Rectangle { height: 4px; }
                         ActionButton {
-                            label: "Sign in in the browser";
+                            label: github-connected ? "Continue to app" : (login-busy ? "Waiting for browser…" : "Sign in in the browser");
                             icon: "\u{f09b}";
                             btn-bg: accent;
                             btn-fg: on-accent;
                             rad: radius;
                             h: 40px;
                             horizontal-stretch: 1;
+                            enabled: !login-busy;
                             clicked => { github-login(); }
+                        }
+                        if login-busy: HorizontalLayout {
+                            spacing: 8px;
+                            if login-code != "": ActionButton {
+                                label: "Open browser again";
+                                icon: "\u{f08e}";
+                                btn-bg: bg;
+                                btn-fg: ink;
+                                rad: radius;
+                                h: 36px;
+                                horizontal-stretch: 1;
+                                clicked => { open-device-page(); }
+                            }
+                            ActionButton {
+                                label: "Cancel";
+                                icon: "\u{f00d}";
+                                btn-bg: transparent;
+                                btn-fg: faint;
+                                rad: radius;
+                                h: 36px;
+                                horizontal-stretch: 1;
+                                clicked => { cancel-login(); }
+                            }
                         }
                         ActionButton {
                             label: "I'm signed in — continue";
@@ -524,6 +619,26 @@ export component AppWindow inherits Window {
                             h: 32px;
                             horizontal-stretch: 1;
                             clicked => { welcome-dismiss(); }
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                Check {
+                                    on: welcome-never;
+                                    accent: accent;
+                                    on-accent: on-accent;
+                                    faint: faint;
+                                    toggled(v) => { welcome-never = v; }
+                                }
+                            }
+                            Text {
+                                text: "Don't show again";
+                                color: faint;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
                         }
                     }
                 }
@@ -608,12 +723,23 @@ export component AppWindow inherits Window {
                             }
                         }
                         ActionButton {
+                            label: push-label;
+                            icon: "\u{f093}";
+                            btn-bg: surface;
+                            btn-fg: ink;
+                            rad: radius;
+                            h: 32px;
+                            enabled: has-selection && !busy && !download-mode;
+                            clicked => { push(active-app); }
+                        }
+                        ActionButton {
                             label: sync-label;
                             icon: "\u{f021}";
                             btn-bg: accent;
                             btn-fg: on-accent;
                             rad: radius;
                             h: 32px;
+                            enabled: !busy;
                             clicked => { github-sync(); }
                         }
                         ActionButton {
@@ -623,33 +749,89 @@ export component AppWindow inherits Window {
                             btn-fg: ink;
                             rad: radius;
                             h: 32px;
-                            clicked => { show-repo-details = !show-repo-details; }
+                            clicked => { toggle-details(); }
                         }
                     }
                     if show-repo-details: VerticalLayout {
                         spacing: 8px;
+                        // Auth: who + SSH state on the left, web login on the right.
+                        HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 9px;
+                                    height: 9px;
+                                    border-radius: 4px;
+                                    background: ssh-state == 1 ? ok : ssh-state == 2 ? warn : faint;
+                                }
+                            }
+                            VerticalLayout {
+                                spacing: 1px;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: github-connected ? "Signed in — sync just works" : "Not signed in yet";
+                                    color: ink;
+                                    font-size: 12px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: ssh-detail;
+                                    color: faint;
+                                    font-size: 11px;
+                                    font-family: "JetBrainsMono Nerd Font";
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                            ActionButton {
+                                label: login-busy ? "Cancel" : "Login via Web";
+                                icon: login-busy ? "\u{f00d}" : "\u{f0ac}";
+                                btn-bg: bg;
+                                btn-fg: ink;
+                                rad: radius;
+                                h: 32px;
+                                enabled: !busy;
+                                clicked => {
+                                    if (login-busy) {
+                                        cancel-login();
+                                    } else {
+                                        github-relogin();
+                                    }
+                                }
+                            }
+                        }
+                        if login-code != "": HorizontalLayout {
+                            spacing: 8px;
+                            alignment: center;
+                            Text {
+                                text: login-code;
+                                color: ink;
+                                font-size: 22px;
+                                font-weight: 800;
+                                font-family: "JetBrainsMono Nerd Font";
+                                vertical-alignment: center;
+                            }
+                            ActionButton {
+                                label: "";
+                                icon: "\u{f0c5}";
+                                btn-bg: transparent;
+                                btn-fg: faint;
+                                rad: radius;
+                                h: 30px;
+                                clicked => { copy-code(); }
+                            }
+                        }
+                        // Repository: local path is fixed (~/config-data),
+                        // only the GitHub URL is ever needed.
                         HorizontalLayout {
                             spacing: 8px;
                             VerticalLayout {
                                 spacing: 3px;
-                                horizontal-stretch: 2;
-                                min-width: 140px;
-                                Text { text: "LOCAL PATH"; color: faint; font-size: 10px; font-weight: 700; }
-                                Field {
-                                    value <=> repo-dir;
-                                    hint: "~/config-data";
-                                    box-bg: bg;
-                                    ink: ink;
-                                    faint: faint;
-                                    accent: accent;
-                                    rad: radius;
-                                }
-                            }
-                            VerticalLayout {
-                                spacing: 3px;
-                                horizontal-stretch: 3;
-                                min-width: 180px;
-                                Text { text: "GITHUB URL (CLONE ONLY)"; color: faint; font-size: 10px; font-weight: 700; }
+                                horizontal-stretch: 1;
+                                Text { text: "GITHUB URL (FOR CLONE)"; color: faint; font-size: 10px; font-weight: 700; }
                                 Field {
                                     value <=> remote-url;
                                     hint: "git@github.com:me/config-data.git";
@@ -660,38 +842,39 @@ export component AppWindow inherits Window {
                                     rad: radius;
                                 }
                             }
+                            VerticalLayout {
+                                alignment: end;
+                                ActionButton {
+                                    label: "Set up";
+                                    icon: "\u{f067}";
+                                    btn-bg: bg;
+                                    btn-fg: ink;
+                                    rad: radius;
+                                    h: 34px;
+                                    enabled: !busy;
+                                    clicked => { repo-setup(); }
+                                }
+                            }
                         }
-                        HorizontalLayout {
+                        if show-ssh-fix: HorizontalLayout {
                             spacing: 8px;
-                            ActionButton {
-                                label: "Set up";
-                                icon: "\u{f067}";
-                                btn-bg: bg;
-                                btn-fg: ink;
-                                rad: radius;
-                                h: 34px;
+                            Text {
+                                text: "Remote uses HTTPS — SSH needs no password.";
+                                color: faint;
+                                font-size: 11px;
+                                vertical-alignment: center;
                                 horizontal-stretch: 1;
-                                clicked => { repo-setup(); }
-                            }
-                            Field {
-                                value <=> restore-path;
-                                hint: ".../zed.bak.123";
-                                box-bg: bg;
-                                ink: ink;
-                                faint: faint;
-                                accent: accent;
-                                rad: radius;
-                                h: 34px;
-                                horizontal-stretch: 2;
+                                wrap: word-wrap;
                             }
                             ActionButton {
-                                label: "Restore";
-                                icon: "\u{f0e2}";
+                                label: "Use SSH";
+                                icon: "\u{f084}";
                                 btn-bg: bg;
                                 btn-fg: ink;
                                 rad: radius;
-                                h: 34px;
-                                clicked => { restore(restore-path); }
+                                h: 32px;
+                                enabled: !busy;
+                                clicked => { fix-ssh-remote(); }
                             }
                         }
                     }
@@ -779,6 +962,7 @@ export component AppWindow inherits Window {
                             btn-fg: on-accent;
                             rad: radius;
                             horizontal-stretch: 1;
+                            enabled: !busy;
                             clicked => { scan(); }
                         }
                     }
@@ -819,6 +1003,22 @@ export component AppWindow inherits Window {
                     if !download-mode: HorizontalLayout {
                         spacing: 8px;
                         Text { text: "FILES"; color: faint; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+                        // Legend: dot colors carry meaning, so name them once.
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle { width: 7px; height: 7px; border-radius: 3px; background: ok; }
+                        }
+                        Text { text: "synced"; color: faint; font-size: 11px; vertical-alignment: center; }
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle { width: 7px; height: 7px; border-radius: 3px; background: warn; }
+                        }
+                        Text { text: "changed"; color: faint; font-size: 11px; vertical-alignment: center; }
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle { width: 7px; height: 7px; border-radius: 3px; background: accent; }
+                        }
+                        Text { text: "new"; color: faint; font-size: 11px; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
                         ActionButton {
                             label: "All";
@@ -826,6 +1026,7 @@ export component AppWindow inherits Window {
                             btn-fg: ink;
                             rad: radius;
                             h: 30px;
+                            enabled: !busy && files.length > 0;
                             clicked => { select-all(); }
                         }
                         ActionButton {
@@ -834,6 +1035,7 @@ export component AppWindow inherits Window {
                             btn-fg: ink;
                             rad: radius;
                             h: 30px;
+                            enabled: !busy && files.length > 0;
                             clicked => { select-none(); }
                         }
                     }
@@ -866,26 +1068,6 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                    }
-                    if !download-mode: HorizontalLayout {
-                        spacing: 8px;
-                        ActionButton {
-                            label: push-label;
-                            icon: "\u{f093}";
-                            btn-bg: surface;
-                            btn-fg: ink;
-                            rad: radius;
-                            clicked => { push(active-app); }
-                        }
-                        ActionButton {
-                            label: apply-label;
-                            icon: "\u{f00c}";
-                            btn-bg: accent;
-                            btn-fg: on-accent;
-                            rad: radius;
-                            clicked => { apply(active-app); }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
                     }
                     if download-mode: Rectangle {
                         background: surface;
@@ -920,14 +1102,107 @@ export component AppWindow inherits Window {
                     if download-mode: HorizontalLayout {
                         spacing: 8px;
                         ActionButton {
-                            label: "Apply all";
+                            label: "Apply to device";
                             icon: "\u{f019}";
                             btn-bg: accent;
                             btn-fg: on-accent;
                             rad: radius;
+                            enabled: has-repo-selection && !busy;
                             clicked => { download(); }
                         }
+                        ActionButton {
+                            label: show-restore ? "Hide restore" : "Restore…";
+                            icon: "\u{f0e2}";
+                            btn-bg: surface;
+                            btn-fg: ink;
+                            rad: radius;
+                            enabled: !busy;
+                            clicked => { toggle-restore(); }
+                        }
                         Rectangle { horizontal-stretch: 1; }
+                    }
+                    if download-mode: Text {
+                        text: "Each app is backed up first — undo anytime via Restore below.";
+                        color: faint;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    if download-mode && show-restore: Rectangle {
+                        background: surface;
+                        border-radius: radius;
+                        clip: true;
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 4px;
+                            Text { text: "BACKUPS"; color: faint; font-size: 11px; font-weight: 700; }
+                            if backup-items.length == 0: Text {
+                                text: "No backups yet — they appear after your first Apply.";
+                                color: faint;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                            for b in backup-items: Rectangle {
+                                height: 30px;
+                                border-radius: 6px;
+                                background: restore-picked == b.path ? sel-bg : transparent;
+                                TouchArea {
+                                    x: 0;
+                                    y: 0;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    mouse-cursor: pointer;
+                                    clicked => { backup-pick(b.path); }
+                                }
+                                HorizontalLayout {
+                                    x: 0;
+                                    y: 0;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: b.path;
+                                        color: ink;
+                                        font-size: 12px;
+                                        font-family: "JetBrainsMono Nerd Font";
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: b.note;
+                                        color: faint;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Field {
+                                    value <=> restore-path;
+                                    hint: "pick above or paste .bak path";
+                                    box-bg: bg;
+                                    ink: ink;
+                                    faint: faint;
+                                    accent: accent;
+                                    rad: radius;
+                                    h: 32px;
+                                    horizontal-stretch: 1;
+                                }
+                                ActionButton {
+                                    label: "Restore";
+                                    icon: "\u{f0e2}";
+                                    btn-bg: bg;
+                                    btn-fg: ink;
+                                    rad: radius;
+                                    h: 32px;
+                                    enabled: !busy && restore-path != "";
+                                    clicked => { restore(restore-path); }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -940,6 +1215,17 @@ export component AppWindow inherits Window {
                     Icon { glyph: "\u{f120}"; fg: faint; px: 12px; }
                 }
                 Text { text: "LOG"; color: faint; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; }
+                ActionButton {
+                    label: copy-label;
+                    icon: "\u{f0c5}";
+                    btn-bg: surface;
+                    btn-fg: ink;
+                    rad: radius;
+                    h: 26px;
+                    enabled: log-text != "";
+                    clicked => { copy-log(); }
+                }
             }
             Rectangle {
                 background: console;
@@ -956,6 +1242,81 @@ export component AppWindow inherits Window {
                             font-family: "JetBrainsMono Nerd Font";
                             font-size: 12px;
                             wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // ---------- Confirm overlay (preview -> confirm -> backup) ----------
+    // Direct child of the Window (not inside the layout), so it can cover all.
+    // Modal for destructive Apply: names what will change and the recovery.
+    if show-confirm: confirm-root := Rectangle {
+        background: bg.with-alpha(0.6);
+        TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            clicked => { confirm-cancel(); }
+        }
+        HorizontalLayout {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            alignment: center;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    background: surface;
+                    border-radius: radius;
+                    min-width: 320px;
+                    max-width: 460px;
+                    VerticalLayout {
+                        padding: 20px;
+                        spacing: 10px;
+                        Text {
+                            text: confirm-title;
+                            color: ink;
+                            font-size: 16px;
+                            font-weight: 700;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: confirm-detail;
+                            color: ink;
+                            font-size: 12px;
+                            font-family: "JetBrainsMono Nerd Font";
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "A backup (.bak + time) is created first — restore from Details if needed.";
+                            color: faint;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            ActionButton {
+                                label: "Cancel";
+                                btn-bg: bg;
+                                btn-fg: ink;
+                                rad: radius;
+                                h: 36px;
+                                horizontal-stretch: 1;
+                                clicked => { confirm-cancel(); }
+                            }
+                            ActionButton {
+                                label: confirm-ok-label;
+                                icon: "\u{f00c}";
+                                btn-bg: accent;
+                                btn-fg: on-accent;
+                                rad: radius;
+                                h: 36px;
+                                horizontal-stretch: 1;
+                                clicked => { confirm-accept(); }
+                            }
                         }
                     }
                 }

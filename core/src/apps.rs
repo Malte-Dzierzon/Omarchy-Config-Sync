@@ -1,25 +1,30 @@
-//! App catalog + live discovery.
+//! App catalog: fully generic, zero per-app definitions.
 //!
-//! - Curated presets carry excludes (machine-local files) and multi-path
-//!   mappings (e.g. omarchy shell).
-//! - [`discover_apps`] merges presets with everything actually present in the
-//!   config dir, so other people's apps (and hand-added ones) show up too.
-//!   Favorites stay pinned on top, the rest is alphabetical.
-//! - Owned [`AppSpec`] (no 'static strings) so discovered apps work everywhere.
+//! Every top-level entry in the config dir is an "app" owning exactly that
+//! one entry (`rel_paths == [id]`). Present-on-disk is the only registry —
+//! cloned repos and hand-added configs work with zero registration, on any
+//! machine. The only curated lists left:
+//! - [`FAVORITES`]: pinned sidebar order.
+//! - [`MACHINE_LOCAL`]: basenames that stay local on every app (per-machine
+//!   files like monitor layouts must not hop between PCs).
 
 use std::path::Path;
 
 /// Pinned favorites, in order: zed, hyprland, omarchy shell, kitty,
-/// fastfetch, neovim.
+/// fastfetch, neovim. Always listed (missing ones show "not installed").
 pub const FAVORITES: [&str; 6] = ["zed", "hypr", "omarchy-shell", "kitty", "fastfetch", "nvim"];
+
+/// Basenames never synced, on every app. Applied globally so no per-app
+/// preset table is needed to protect machine-local files.
+pub const MACHINE_LOCAL: &[&str] = &["monitors.lua", "input.lua"];
 
 #[derive(Debug, Clone)]
 pub struct AppSpec {
     pub id: String,
     pub label: String,
-    /// Files/dirs relative to config dir, e.g. `zed` or `omarchy/shell.json`.
+    /// Exactly one top-level entry (see [`AppSpec::root`]).
     pub rel_paths: Vec<String>,
-    /// Basenames never synced (machine-local), e.g. `monitors.lua`.
+    /// Basenames never synced (machine-local), from [`MACHINE_LOCAL`].
     pub exclude_files: Vec<String>,
 }
 
@@ -27,60 +32,23 @@ impl AppSpec {
     pub fn is_favorite(&self) -> bool {
         FAVORITES.contains(&self.id.as_str())
     }
-}
 
-fn preset(id: &str, label: &str, rel_paths: &[&str], exclude_files: &[&str]) -> AppSpec {
-    AppSpec {
-        id: id.to_string(),
-        label: label.to_string(),
-        rel_paths: rel_paths.iter().map(|s| s.to_string()).collect(),
-        exclude_files: exclude_files.iter().map(|s| s.to_string()).collect(),
+    /// The single top-level entry this app owns.
+    pub fn root(&self) -> &str {
+        self.rel_paths
+            .first()
+            .map(String::as_str)
+            .unwrap_or(&self.id)
     }
 }
 
-pub fn builtin_apps() -> Vec<AppSpec> {
-    vec![
-        preset("zed", "Zed", &["zed"], &[]),
-        preset(
-            "hypr",
-            "Hyprland",
-            &["hypr"],
-            &["monitors.lua", "input.lua"],
-        ),
-        preset(
-            "omarchy-shell",
-            "Omarchy shell",
-            &["omarchy/shell.json", "omarchy/extensions"],
-            &[],
-        ),
-        preset("alacritty", "Alacritty", &["alacritty"], &[]),
-        preset("ghostty", "Ghostty", &["ghostty"], &[]),
-        preset("foot", "Foot", &["foot"], &[]),
-        preset("kitty", "Kitty", &["kitty"], &[]),
-        preset("starship", "Starship", &["starship.toml"], &[]),
-        preset("btop", "btop", &["btop"], &[]),
-        preset("lazygit", "Lazygit", &["lazygit"], &[]),
-        preset("fastfetch", "Fastfetch", &["fastfetch"], &[]),
-        preset("nvim", "Neovim", &["nvim"], &[]),
-    ]
-}
-
-/// Curated preset by id.
-pub fn find_app(id: &str) -> Option<AppSpec> {
-    builtin_apps().into_iter().find(|a| a.id == id)
-}
-
-/// Any id (preset or present-on-disk) resolves to a spec. Unknown ids become
-/// a plain single-root spec, so cloned repos and hand-added configs just work.
+/// Any id resolves to a spec — no registry lookup, no missing case.
 pub fn resolve_app(_config_dir: &Path, id: &str) -> AppSpec {
-    if let Some(p) = find_app(id) {
-        return p;
-    }
     AppSpec {
         id: id.to_string(),
         label: prettify(id),
         rel_paths: vec![id.to_string()],
-        exclude_files: Vec::new(),
+        exclude_files: MACHINE_LOCAL.iter().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -93,42 +61,26 @@ fn prettify(id: &str) -> String {
     }
 }
 
-/// Favorites pinned first (in [`FAVORITES`] order), then every other preset
-/// plus every discovered config-dir entry, alphabetical by label.
-/// Preset-claimed top-level names (e.g. `omarchy`) are not duplicated.
+/// Favorites pinned first (in [`FAVORITES`] order), then every top-level
+/// config-dir entry, alphabetical by label.
 pub fn discover_apps(config_dir: &Path) -> Vec<AppSpec> {
-    let presets = builtin_apps();
-    let claimed: Vec<String> = presets
-        .iter()
-        .flat_map(|a| a.rel_paths.iter())
-        .map(|r| r.split('/').next().unwrap_or(r).to_string())
-        .collect();
     let mut out: Vec<AppSpec> = FAVORITES
         .iter()
-        .filter_map(|fid| presets.iter().find(|a| &a.id == fid).cloned())
+        .map(|fid| resolve_app(config_dir, fid))
         .collect();
-    let mut rest: Vec<AppSpec> = presets
-        .into_iter()
-        .filter(|a| !FAVORITES.contains(&a.id.as_str()))
-        .collect();
-    if let Ok(rd) = std::fs::read_dir(config_dir) {
-        let mut names: Vec<String> = rd
+    let mut names: Vec<String> = match std::fs::read_dir(config_dir) {
+        Ok(rd) => rd
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        for n in names {
-            if claimed.iter().any(|c| c == &n) {
-                continue;
-            }
-            rest.push(AppSpec {
-                id: n.clone(),
-                label: prettify(&n),
-                rel_paths: vec![n],
-                exclude_files: Vec::new(),
-            });
-        }
-    }
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    let mut rest: Vec<AppSpec> = names
+        .into_iter()
+        .filter(|n| !FAVORITES.contains(&n.as_str()))
+        .map(|n| resolve_app(config_dir, &n))
+        .collect();
     rest.sort_by(|a, b| a.label.cmp(&b.label));
     out.extend(rest);
     out
@@ -150,7 +102,17 @@ mod tests {
         }
         let ids: Vec<_> = apps.iter().map(|a| a.id.as_str()).collect();
         assert!(ids.contains(&"mycoolapp"));
-        assert!(ids.contains(&"kitty")); // preset even when missing
-        assert!(resolve_app(cfg, "mycoolapp").rel_paths == vec!["mycoolapp".to_string()]);
+        // favorites are listed even when missing from disk
+        assert!(ids.contains(&"kitty"));
+        let custom = resolve_app(cfg, "mycoolapp");
+        assert_eq!(custom.rel_paths, vec!["mycoolapp".to_string()]);
+        assert_eq!(custom.root(), "mycoolapp");
+    }
+
+    #[test]
+    fn machine_local_excludes_apply_to_every_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = resolve_app(tmp.path(), "anything-at-all");
+        assert_eq!(a.exclude_files, vec!["monitors.lua", "input.lua"]);
     }
 }

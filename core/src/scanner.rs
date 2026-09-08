@@ -114,27 +114,6 @@ pub fn scan_apps_parallel(config_dir: &Path, apps: &[AppSpec]) -> Vec<AppStatus>
     })
 }
 
-/// Names of all other top-level entries in config dir (read-only, for the picker).
-pub fn scan_other_entries(config_dir: &Path, known: &[AppSpec]) -> Vec<String> {
-    let known_tops: Vec<&str> = known
-        .iter()
-        .flat_map(|a| a.rel_paths.iter())
-        .map(|r| r.split('/').next().unwrap_or(r))
-        .collect();
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(config_dir) else {
-        return out;
-    };
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if !known_tops.contains(&name.as_str()) {
-            out.push(name);
-        }
-    }
-    out.sort();
-    out
-}
-
 #[derive(Default)]
 struct Counts {
     files: usize,
@@ -260,7 +239,7 @@ mod tests {
             symlink("nope.json", cfg.join("zed/broken.json")).unwrap();
             symlink(cfg.join("zed"), cfg.join("zed/loop")).unwrap();
         }
-        let apps = crate::builtin_apps();
+        let apps = crate::apps::discover_apps(&cfg);
         let st = scan_apps_parallel(&cfg, &apps);
         assert_eq!(st.len(), apps.len()); // order + count preserved
         assert_eq!(st[0].id, apps[0].id);

@@ -2,9 +2,11 @@
 //! All functions take explicit paths. No globals, no deletes, copy-only.
 
 pub mod apps;
+pub mod clipboard;
 pub mod git;
+pub mod prefs;
 pub mod scanner;
 pub mod store;
 pub mod theme;
 
-pub use apps::{builtin_apps, AppSpec};
+pub use apps::AppSpec;

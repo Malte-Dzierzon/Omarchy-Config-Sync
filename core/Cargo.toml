@@ -8,6 +8,10 @@ license.workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Already in the tree transitively; needed directly for process-group kill
+# (killpg) so timeouts reap grandchildren like pack-objects/ssh too.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

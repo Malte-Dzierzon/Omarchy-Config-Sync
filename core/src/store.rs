@@ -53,13 +53,51 @@ pub fn preview(config_dir: &Path, repo_app_dir: &Path, app: &AppSpec) -> io::Res
     Ok(ops)
 }
 
+/// Budget caps: sync stays fast and repos stay small no matter which app
+/// (or how bloated its cache dirs) is selected. Skipped files are counted
+/// in [`SkipStats`] and surfaced — never silently dragged along.
+pub const MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_FILES_PER_APP: usize = 20_000;
+
+/// Files skipped while walking, for honest UI counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkipStats {
+    /// Over [`MAX_FILE_BYTES`] (caches, blobs, datasets).
+    pub large: usize,
+    /// Vanished or permission-denied mid-walk.
+    pub unreadable: usize,
+    /// Hit [`MAX_FILES_PER_APP`]; the walk stopped early.
+    pub truncated: bool,
+}
+
+impl SkipStats {
+    pub fn add(&mut self, o: &SkipStats) {
+        self.large += o.large;
+        self.unreadable += o.unreadable;
+        self.truncated = self.truncated || o.truncated;
+    }
+
+    pub fn total(&self) -> usize {
+        self.large + self.unreadable
+    }
+}
+
+/// Outcome of [`snapshot_selected`]: what landed in the repo vs. what was
+/// deliberately left out (see [`SkipStats`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnapshotReport {
+    pub copied: usize,
+    pub skipped: SkipStats,
+}
+
 /// Snapshot config -> repo/<app>/ (copy-only). Writes manifest.json alongside.
 pub fn snapshot_to_repo(
     config_dir: &Path,
     repo_app_dir: &Path,
     app: &AppSpec,
-) -> io::Result<usize> {
+) -> io::Result<SnapshotReport> {
     let all: std::collections::HashSet<PathBuf> = list_local_rels(config_dir, app)?
+        .0
         .into_iter()
         .map(|f| f.rel)
         .collect();
@@ -67,56 +105,95 @@ pub fn snapshot_to_repo(
 }
 
 /// Snapshot only the selected repo-layout files. Writes manifest.json alongside.
+/// Files over [`MAX_FILE_BYTES`] are skipped (counted, never copied); a
+/// permission-denied subdir skips just that dir instead of aborting the app.
 pub fn snapshot_selected(
     config_dir: &Path,
     repo_app_dir: &Path,
     app: &AppSpec,
     selected: &std::collections::HashSet<PathBuf>,
-) -> io::Result<usize> {
-    let mut copied = 0usize;
+) -> io::Result<SnapshotReport> {
+    let mut report = SnapshotReport::default();
+    if selected.is_empty() {
+        return Ok(report); // nothing to find: skip giant walks entirely
+    }
+    // Walk budget: even finding selected files inside a giant tree must end.
+    // `seen` counts every usable entry (selected or not); copies stop with
+    // `truncated` set instead of wandering forever.
+    let mut seen = 0usize;
+    // Local helper: cap + exclusion in one place so both walk arms agree.
+    let usable = |p: &Path, m: &std::fs::Metadata, stats: &mut SkipStats| -> bool {
+        if is_excluded(p, &app.exclude_files) {
+            return false;
+        }
+        if m.is_file() && m.len() > MAX_FILE_BYTES {
+            stats.large += 1;
+            return false;
+        }
+        true
+    };
     for rel in &app.rel_paths {
         let src = config_dir.join(rel);
         let meta = match std::fs::symlink_metadata(&src) {
             Ok(m) => m,
-            Err(_) => continue, // missing/unreadable root: skip, never abort
+            Err(_) => {
+                report.skipped.unreadable += 1;
+                continue; // missing/unreadable root: skip, never abort
+            }
         };
         if meta.is_symlink() || meta.is_file() {
-            if is_excluded(&src, &app.exclude_files) {
+            if !usable(&src, &meta, &mut report.skipped) {
                 continue;
             }
             let repo_rel = PathBuf::from(src.file_name().unwrap_or_default());
             if selected.contains(&repo_rel) {
                 std::fs::create_dir_all(repo_app_dir)?;
                 copy_file(&src, &repo_app_dir.join(&repo_rel))?;
-                copied += 1;
+                report.copied += 1;
             }
         } else if meta.is_dir() {
             let mut stack = vec![src.clone()];
             while let Some(dir) = stack.pop() {
-                for e in std::fs::read_dir(&dir)?.flatten() {
-                    let p = e.path();
-                    if is_excluded(&p, &app.exclude_files) {
+                let rd = match std::fs::read_dir(&dir) {
+                    Ok(rd) => rd,
+                    Err(_) => {
+                        report.skipped.unreadable += 1;
                         continue;
                     }
+                };
+                for e in rd.flatten() {
+                    let p = e.path();
                     let m = match std::fs::symlink_metadata(&p) {
                         Ok(m) => m,
-                        Err(_) => continue,
+                        Err(_) => {
+                            report.skipped.unreadable += 1;
+                            continue;
+                        }
                     };
+                    if !usable(&p, &m, &mut report.skipped) {
+                        continue;
+                    }
                     if m.is_dir() && !m.is_symlink() {
                         stack.push(p);
                     } else if m.is_file() || m.is_symlink() {
+                        seen += 1;
+                        if seen > MAX_FILES_PER_APP {
+                            report.skipped.truncated = true;
+                            write_manifest(repo_app_dir, &app.id, report.copied)?;
+                            return Ok(report);
+                        }
                         let repo_rel = p.strip_prefix(&src).unwrap_or(&p).to_path_buf();
                         if selected.contains(&repo_rel) {
                             copy_file(&p, &repo_app_dir.join(&repo_rel))?;
-                            copied += 1;
+                            report.copied += 1;
                         }
                     }
                 }
             }
         }
     }
-    write_manifest(repo_app_dir, &app.id, copied)?;
-    Ok(copied)
+    write_manifest(repo_app_dir, &app.id, report.copied)?;
+    Ok(report)
 }
 
 #[derive(Debug, Clone)]
@@ -128,51 +205,103 @@ pub struct SelectableFile {
 }
 
 /// All syncable local files of an app in repo layout (excludes applied).
-/// Sorted. For the per-file checklist.
-pub fn list_local_rels(config_dir: &Path, app: &AppSpec) -> io::Result<Vec<SelectableFile>> {
+/// Sorted. For the per-file checklist. Over-`MAX_FILE_BYTES` files and the
+/// tail past `MAX_FILES_PER_APP` are reported in [`SkipStats`], never listed.
+pub fn list_local_rels(
+    config_dir: &Path,
+    app: &AppSpec,
+) -> io::Result<(Vec<SelectableFile>, SkipStats)> {
     let mut out = Vec::new();
+    let mut skipped = SkipStats::default();
     for rel in &app.rel_paths {
+        if skipped.truncated {
+            break;
+        }
         let src = config_dir.join(rel);
         let meta = match std::fs::symlink_metadata(&src) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => {
+                skipped.unreadable += 1;
+                continue;
+            }
         };
         if meta.is_symlink() || meta.is_file() {
             if is_excluded(&src, &app.exclude_files) {
                 continue;
             }
-            out.push(SelectableFile {
-                rel: PathBuf::from(src.file_name().unwrap_or_default()),
-                bytes: if meta.is_symlink() { 0 } else { meta.len() },
-                is_link: meta.is_symlink(),
-            });
+            push_capped(
+                &mut out,
+                &mut skipped,
+                PathBuf::from(src.file_name().unwrap_or_default()),
+                if meta.is_symlink() { 0 } else { meta.len() },
+                meta.is_symlink(),
+            );
         } else if meta.is_dir() {
             let mut stack = vec![src.clone()];
             while let Some(dir) = stack.pop() {
-                for e in std::fs::read_dir(&dir)?.flatten() {
+                if skipped.truncated {
+                    break;
+                }
+                let rd = match std::fs::read_dir(&dir) {
+                    Ok(rd) => rd,
+                    Err(_) => {
+                        skipped.unreadable += 1;
+                        continue;
+                    }
+                };
+                for e in rd.flatten() {
                     let p = e.path();
                     if is_excluded(&p, &app.exclude_files) {
                         continue;
                     }
                     let m = match std::fs::symlink_metadata(&p) {
                         Ok(m) => m,
-                        Err(_) => continue,
+                        Err(_) => {
+                            skipped.unreadable += 1;
+                            continue;
+                        }
                     };
                     if m.is_dir() && !m.is_symlink() {
                         stack.push(p);
                     } else if m.is_file() || m.is_symlink() {
-                        out.push(SelectableFile {
-                            rel: p.strip_prefix(&src).unwrap_or(&p).to_path_buf(),
-                            bytes: if m.is_symlink() { 0 } else { m.len() },
-                            is_link: m.is_symlink(),
-                        });
+                        push_capped(
+                            &mut out,
+                            &mut skipped,
+                            p.strip_prefix(&src).unwrap_or(&p).to_path_buf(),
+                            if m.is_symlink() { 0 } else { m.len() },
+                            m.is_symlink(),
+                        );
                     }
                 }
             }
         }
     }
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
-    Ok(out)
+    Ok((out, skipped))
+}
+
+/// Push one entry with budget enforcement (see [`list_local_rels`]).
+/// Free function (not a closure) so loop conditions can read the stats.
+fn push_capped(
+    out: &mut Vec<SelectableFile>,
+    skipped: &mut SkipStats,
+    rel: PathBuf,
+    bytes: u64,
+    is_link: bool,
+) {
+    if !is_link && bytes > MAX_FILE_BYTES {
+        skipped.large += 1;
+        return;
+    }
+    if out.len() >= MAX_FILES_PER_APP {
+        skipped.truncated = true;
+        return;
+    }
+    out.push(SelectableFile {
+        rel,
+        bytes,
+        is_link,
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,13 +321,16 @@ pub struct FileCompare {
 
 /// Local-vs-repo comparison over the union of both sides (excludes applied).
 /// `selected` filters repo-layout rels when `Some`. Never aborts on single
-/// unreadable files — those read as `Modified`.
+/// unreadable files — those read as `Modified`. Over-`MAX_FILE_BYTES` files
+/// compare by size only (documented heuristic: reading GBs on every refresh
+/// costs more than the rare same-size change it could miss); everything
+/// skipped is reported in the returned [`SkipStats`].
 pub fn compare(
     config_dir: &Path,
     repo_app_dir: &Path,
     app: &AppSpec,
     selected: Option<&[PathBuf]>,
-) -> io::Result<Vec<FileCompare>> {
+) -> io::Result<(Vec<FileCompare>, SkipStats)> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let keep = |rel: &Path| {
@@ -206,7 +338,8 @@ pub fn compare(
             .map(|s| s.iter().any(|x| x.as_path() == rel))
             .unwrap_or(true)
     };
-    for f in list_local_rels(config_dir, app)? {
+    let (locals, mut skipped) = list_local_rels(config_dir, app)?;
+    for f in locals {
         if !keep(&f.rel) {
             continue;
         }
@@ -231,6 +364,10 @@ pub fn compare(
         if seen.contains(&rel) || is_excluded_rel(&rel, &app.exclude_files) || !keep(&rel) {
             continue;
         }
+        if out.len() >= MAX_FILES_PER_APP {
+            skipped.truncated = true;
+            break;
+        }
         out.push(FileCompare {
             bytes: repo_file.symlink_metadata().map(|m| m.len()).unwrap_or(0),
             rel,
@@ -238,7 +375,7 @@ pub fn compare(
         });
     }
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
-    Ok(out)
+    Ok((out, skipped))
 }
 
 fn exists_any(p: &Path) -> bool {
@@ -578,25 +715,9 @@ pub fn restore_backup(backup: &Path, original: &Path) -> io::Result<RestoreRepor
 // --- helpers (all copy-only, no removes) ---
 
 fn target_for_rel(config_dir: &Path, app: &AppSpec, rel: &Path) -> PathBuf {
-    // repo layout mirrors the FIRST matching rel root.
-    // zed: repo "keymap.json" -> ~/.config/zed/keymap.json
-    // omarchy-shell: repo "shell.json" -> ~/.config/omarchy/shell.json
-    let rel_str = rel.to_string_lossy().replace('\\', "/");
-    for root in &app.rel_paths {
-        let root_file = Path::new(root).file_name().and_then(|n| n.to_str());
-        if let Some(f) = root_file {
-            if rel_str == f || rel_str.starts_with(&format!("{f}/")) {
-                // map back under the root's parent
-                let parent = Path::new(root).parent().unwrap_or(Path::new(""));
-                return config_dir.join(parent).join(&rel_str);
-            }
-        }
-        // single-dir roots like "zed"/"hypr": repo files sit at app root
-        if !root.contains('/') {
-            return config_dir.join(root).join(&rel_str);
-        }
-    }
-    config_dir.join(&rel_str)
+    // Generic single-root layout: every app owns exactly one top-level
+    // entry, repo paths mirror beneath it. No per-app mapping tables.
+    config_dir.join(app.root()).join(rel)
 }
 
 fn collect_repo_files(repo_app_dir: &Path) -> io::Result<Vec<(PathBuf, PathBuf)>> {
@@ -640,6 +761,11 @@ fn files_differ(a: &Path, b: &Path) -> io::Result<bool> {
         return Ok(true);
     }
     if ma.len() == 0 {
+        return Ok(false);
+    }
+    if !ma.is_symlink() && ma.len() > MAX_FILE_BYTES {
+        // Giants compare by size only (see `compare`): same size counts as
+        // synced so every refresh doesn't re-read gigabytes.
         return Ok(false);
     }
     // Chunked compare: bounded memory + early exit on the first
@@ -716,13 +842,30 @@ fn copy_file(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 fn is_excluded(path: &Path, exclude: &[String]) -> bool {
+    if is_backup_name(path) {
+        // Our own recovery litter (`*.bak.<epoch>`): created by Apply on this
+        // machine, must never be synced back into the repo and re-pushed.
+        return true;
+    }
     path.file_name()
         .and_then(|n| n.to_str())
         .map(|n| exclude.iter().any(|e| e == n))
         .unwrap_or(false)
 }
 
+/// Backup file name (`settings.json.bak.175…`)? Matches restores created by
+/// Apply/Restore, never user content (which has no `.bak.` infix).
+fn is_backup_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.contains(".bak."))
+        .unwrap_or(false)
+}
+
 fn is_excluded_rel(rel: &Path, exclude: &[String]) -> bool {
+    if is_backup_name(rel) {
+        return true;
+    }
     rel.components().any(|c| {
         c.as_os_str()
             .to_str()
@@ -733,6 +876,12 @@ fn is_excluded_rel(rel: &Path, exclude: &[String]) -> bool {
 
 fn write_manifest(repo_app_dir: &Path, app_id: &str, files: usize) -> io::Result<()> {
     std::fs::create_dir_all(repo_app_dir)?;
+    // Idempotent: a snapshot that changed nothing but the timestamp must not
+    // dirty the repo — otherwise every Push commits a timestamp-only "sync"
+    // forever and never reports "nothing to commit".
+    if manifest_covers(repo_app_dir.join("manifest.json"), app_id, files) {
+        return Ok(());
+    }
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -750,10 +899,24 @@ fn write_manifest(repo_app_dir: &Path, app_id: &str, files: usize) -> io::Result
     Ok(())
 }
 
+/// True when the existing manifest already records this app + file count
+/// (only the timestamp would change — not worth dirtying the repo for).
+fn manifest_covers(manifest: PathBuf, app_id: &str, files: usize) -> bool {
+    let Ok(old) = std::fs::read_to_string(&manifest) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&old) else {
+        return false;
+    };
+    v.get("app").and_then(|a| a.as_str()) == Some(app_id)
+        && v.get("files").and_then(|f| f.as_u64()) == Some(files as u64)
+        && v.get("schema_version").and_then(|s| s.as_u64()) == Some(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apps::find_app;
+    use crate::apps::resolve_app;
 
     fn write(p: &Path, content: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -766,10 +929,11 @@ mod tests {
         let cfg = tmp.path().join("config");
         write(&cfg.join("hypr/monitors.lua"), "local");
         write(&cfg.join("hypr/hyprland.conf"), "ok");
-        let app = find_app("hypr").unwrap();
+        let app = resolve_app(Path::new(""), "hypr");
         let repo = tmp.path().join("repo/hypr");
-        let n = snapshot_to_repo(&cfg, &repo, &app).unwrap();
-        assert_eq!(n, 1);
+        let r = snapshot_to_repo(&cfg, &repo, &app).unwrap();
+        assert_eq!(r.copied, 1);
+        assert_eq!(r.skipped, SkipStats::default());
         assert!(!repo.join("monitors.lua").exists());
         assert!(repo.join("hyprland.conf").exists());
     }
@@ -781,7 +945,7 @@ mod tests {
         let repo = tmp.path().join("repo/zed");
         write(&cfg.join("zed/settings.json"), "old");
         write(&repo.join("settings.json"), "new");
-        let app = find_app("zed").unwrap();
+        let app = resolve_app(Path::new(""), "zed");
         let plan = preview(&cfg, &repo, &app).unwrap();
         assert!(plan.iter().any(|o| o.kind == OpKind::Overwrite));
         let report = apply_plan(&cfg, &repo, &app, &plan).unwrap();
@@ -805,7 +969,7 @@ mod tests {
         let cfg = tmp.path().join("config");
         let repo = tmp.path().join("repo/zed");
         write(&repo.join("keymap.json"), "keys");
-        let app = find_app("zed").unwrap();
+        let app = resolve_app(Path::new(""), "zed");
         let plan = preview(&cfg, &repo, &app).unwrap();
         apply_plan(&cfg, &repo, &app, &plan).unwrap();
         let again = preview(&cfg, &repo, &app).unwrap();
@@ -819,7 +983,7 @@ mod tests {
         let repo = tmp.path().join("repo/zed");
         write(&cfg.join("zed/settings.json"), "old");
         write(&repo.join("settings.json"), "new");
-        let app = find_app("zed").unwrap();
+        let app = resolve_app(Path::new(""), "zed");
         let plan = preview(&cfg, &repo, &app).unwrap();
         let report = apply_plan(&cfg, &repo, &app, &plan).unwrap();
         // user adds a new file after apply
@@ -847,9 +1011,9 @@ mod tests {
         std::fs::create_dir_all(cfg.join("zed")).unwrap();
         write(&cfg.join("zed/real.json"), "{}");
         symlink("real.json", cfg.join("zed/link.json")).unwrap();
-        let app = find_app("zed").unwrap();
-        let n = snapshot_to_repo(&cfg, &repo, &app).unwrap();
-        assert_eq!(n, 2);
+        let app = resolve_app(Path::new(""), "zed");
+        let r = snapshot_to_repo(&cfg, &repo, &app).unwrap();
+        assert_eq!(r.copied, 2);
         // stored as link, not followed
         assert!(std::fs::symlink_metadata(repo.join("link.json"))
             .unwrap()
@@ -876,8 +1040,9 @@ mod tests {
         write(&repo.join("changed.json"), "repo");
         write(&repo.join("only-repo.json"), "gone");
         write(&repo.join("manifest.json"), "{}");
-        let app = find_app("zed").unwrap();
-        let cmp = compare(&cfg, &repo, &app, None).unwrap();
+        let app = resolve_app(Path::new(""), "zed");
+        let (cmp, skipped) = compare(&cfg, &repo, &app, None).unwrap();
+        assert_eq!(skipped, SkipStats::default());
         let state = |n: &str| {
             cmp.iter()
                 .find(|c| c.rel.as_path() == Path::new(n))
@@ -898,10 +1063,13 @@ mod tests {
         let repo = tmp.path().join("repo/zed");
         write(&cfg.join("zed/a.json"), "a1");
         write(&cfg.join("zed/b.json"), "b1");
-        let app = find_app("zed").unwrap();
+        let app = resolve_app(Path::new(""), "zed");
         // push only a.json
         let sel: HashSet<PathBuf> = [PathBuf::from("a.json")].into();
-        assert_eq!(snapshot_selected(&cfg, &repo, &app, &sel).unwrap(), 1);
+        assert_eq!(
+            snapshot_selected(&cfg, &repo, &app, &sel).unwrap().copied,
+            1
+        );
         assert!(repo.join("a.json").exists());
         assert!(!repo.join("b.json").exists());
         // repo moves on for a.json only
@@ -920,7 +1088,7 @@ mod tests {
         );
         assert!(r.merged_back >= 1);
         // machine-local files survive selective apply too
-        let app_hypr = find_app("hypr").unwrap();
+        let app_hypr = resolve_app(Path::new(""), "hypr");
         write(&cfg.join("hypr/hyprland.conf"), "conf1");
         write(&cfg.join("hypr/monitors.lua"), "local-mon");
         write(&repo.join("hyprland.conf"), "conf2");
@@ -944,7 +1112,7 @@ mod tests {
         let repo = tmp.path().join("repo/zed");
         write(&cfg.join("zed/settings.json"), "same");
         write(&repo.join("settings.json"), "same");
-        let app = find_app("zed").unwrap();
+        let app = resolve_app(Path::new(""), "zed");
         let plan = preview(&cfg, &repo, &app).unwrap();
         assert!(plan.iter().all(|o| o.kind == OpKind::Unchanged));
         let r = apply_plan(&cfg, &repo, &app, &plan).unwrap();
@@ -981,5 +1149,116 @@ mod tests {
         std::fs::write(&e2, b"").unwrap();
         assert!(!super::files_differ(&e, &e2).unwrap());
         assert!(super::files_differ(&e, &tmp.path().join("nope")).is_err());
+    }
+
+    #[test]
+    fn large_files_skip_snapshot_and_list_but_compare_by_size() {
+        use std::collections::HashSet;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let repo = tmp.path().join("repo/big");
+        // Sparse 26 MB file: instant to create, reads as zeros.
+        let big = cfg.join("big/blob.bin");
+        std::fs::create_dir_all(big.parent().unwrap()).unwrap();
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_FILE_BYTES + 1024).unwrap();
+        write(&cfg.join("big/small.json"), "{}");
+        let app = AppSpec {
+            id: "big".to_string(),
+            label: "Big".to_string(),
+            rel_paths: vec!["big".to_string()],
+            exclude_files: vec![],
+        };
+        let (locals, skipped) = list_local_rels(&cfg, &app).unwrap();
+        assert_eq!(locals.len(), 1); // only small.json
+        assert_eq!(skipped.large, 1);
+        let sel: HashSet<PathBuf> = [PathBuf::from("small.json")].into();
+        let r = snapshot_selected(&cfg, &repo, &app, &sel).unwrap();
+        // small.json copied; the giant is counted even though unselected —
+        // the walk saw it and deliberately left it out.
+        assert_eq!((r.copied, r.skipped.large), (1, 1));
+        // Equal-size giants compare by size only (no 26 MB read).
+        let staged = repo.join("blob.bin");
+        std::fs::create_dir_all(repo.clone()).unwrap();
+        let g = std::fs::File::create(&staged).unwrap();
+        g.set_len(MAX_FILE_BYTES + 1024).unwrap();
+        assert!(!super::files_differ(&big, &staged).unwrap());
+        let h = std::fs::File::create(tmp.path().join("short.bin")).unwrap();
+        h.set_len(8).unwrap();
+        assert!(super::files_differ(&big, tmp.path().join("short.bin").as_path()).unwrap());
+    }
+
+    #[test]
+    fn own_backups_never_sync() {
+        use std::collections::HashSet;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let repo = tmp.path().join("repo/zed");
+        write(&cfg.join("zed/settings.json"), "{}");
+        write(&cfg.join("zed/settings.json.bak.123"), "old");
+        let app = resolve_app(Path::new(""), "zed");
+        let (locals, skipped) = list_local_rels(&cfg, &app).unwrap();
+        assert_eq!(locals.len(), 1);
+        assert_eq!(skipped, SkipStats::default());
+        let sel: HashSet<PathBuf> = [
+            PathBuf::from("settings.json"),
+            PathBuf::from("settings.json.bak.123"),
+        ]
+        .into();
+        let r = snapshot_selected(&cfg, &repo, &app, &sel).unwrap();
+        assert_eq!(r.copied, 1);
+        assert!(!repo.join("settings.json.bak.123").exists());
+        // …and repo-side litter stays invisible to compare.
+        write(&repo.join("stale.bak.9"), "x");
+        let (cmp, _) = compare(&cfg, &repo, &app, None).unwrap();
+        assert!(cmp
+            .iter()
+            .all(|c| !c.rel.to_string_lossy().contains(".bak.")));
+    }
+
+    #[test]
+    fn walk_stops_at_file_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let dir = cfg.join("many");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..(MAX_FILES_PER_APP + 5) {
+            std::fs::write(dir.join(format!("f{i:05}.json")), "{}").unwrap();
+        }
+        let app = AppSpec {
+            id: "many".to_string(),
+            label: "Many".to_string(),
+            rel_paths: vec!["many".to_string()],
+            exclude_files: vec![],
+        };
+        let (locals, skipped) = list_local_rels(&cfg, &app).unwrap();
+        assert_eq!(locals.len(), MAX_FILES_PER_APP);
+        assert!(skipped.truncated);
+    }
+
+    #[test]
+    fn manifest_rewrite_is_idempotent() {
+        use std::collections::HashSet;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let repo = tmp.path().join("repo/zed");
+        write(&cfg.join("zed/settings.json"), "{}");
+        let app = resolve_app(Path::new(""), "zed");
+        let sel: HashSet<PathBuf> = [PathBuf::from("settings.json")].into();
+        snapshot_selected(&cfg, &repo, &app, &sel).unwrap();
+        let first = std::fs::read(repo.join("manifest.json")).unwrap();
+        // A snapshot that changes nothing must leave the manifest
+        // byte-identical (the epoch alone must not dirty the repo, or every
+        // Push commits a timestamp-only "sync" forever). The sleep rules out
+        // a same-second false pass.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        snapshot_selected(&cfg, &repo, &app, &sel).unwrap();
+        assert_eq!(std::fs::read(repo.join("manifest.json")).unwrap(), first);
+        // …while a real change (new file count) still refreshes it.
+        write(&cfg.join("zed/extra.json"), "{}");
+        let sel2: HashSet<PathBuf> =
+            [PathBuf::from("settings.json"), PathBuf::from("extra.json")].into();
+        snapshot_selected(&cfg, &repo, &app, &sel2).unwrap();
+        assert_ne!(std::fs::read(repo.join("manifest.json")).unwrap(), first);
     }
 }
